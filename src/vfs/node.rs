@@ -1,10 +1,12 @@
 use rand::rngs::StdRng;
 use rand::{Rng, RngCore, SeedableRng};
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::cli::Config;
+use crate::dictionary::SizeRange;
 use crate::vfs::naming::NameGenerator;
 
 #[derive(Debug, Clone)]
@@ -18,6 +20,8 @@ pub struct ChildEntry {
     pub path: String,
     pub is_directory: bool,
     pub source_path: Option<PathBuf>,
+    pub size_bytes: Option<u64>,
+    pub modified_unix_seconds: Option<i64>,
 }
 
 #[derive(Debug, Clone)]
@@ -90,6 +94,8 @@ fn build_listing(
                 path: child_path,
                 is_directory: real_child.is_directory,
                 source_path: Some(real_child.path),
+                size_bytes: real_child.size_bytes,
+                modified_unix_seconds: real_child.modified_unix_seconds,
             });
         }
     } else {
@@ -101,12 +107,21 @@ fn build_listing(
 
         let file_count = rng.gen_range(config.min_files..=config.max_files);
         for _ in 0..file_count {
-            let name = unique_name(&mut rng, &mut used_names, |rng| name_generator.file_name(rng));
+            let name = unique_name(&mut rng, &mut used_names, |rng| {
+                name_generator.file_name(rng)
+            });
             children.push(ChildEntry {
                 name: name.clone(),
                 path: join_path(path, &name),
                 is_directory: false,
                 source_path: None,
+                size_bytes: Some(generated_file_size(config, path, depth, &name)),
+                modified_unix_seconds: Some(deterministic_modified_seconds(
+                    config.seed,
+                    path,
+                    depth,
+                    &name,
+                )),
             });
         }
 
@@ -121,6 +136,13 @@ fn build_listing(
                     path: join_path(path, &name),
                     is_directory: true,
                     source_path: None,
+                    size_bytes: None,
+                    modified_unix_seconds: Some(deterministic_modified_seconds(
+                        config.seed,
+                        path,
+                        depth,
+                        &name,
+                    )),
                 });
             }
         }
@@ -140,6 +162,8 @@ fn build_listing(
                         path: child_path,
                         is_directory: real_child.is_directory,
                         source_path: Some(real_child.path),
+                        size_bytes: real_child.size_bytes,
+                        modified_unix_seconds: real_child.modified_unix_seconds,
                     });
                 }
             }
@@ -179,10 +203,20 @@ fn render_file_content(
     file_name: &str,
     depth: usize,
 ) -> String {
-    format!(
-        "seed={} path={} depth={} file={}\n",
-        config.seed, parent_path, depth, file_name
-    )
+    let mut rng = file_rng(config.seed, parent_path, depth, file_name);
+    let size = file_content_size(config, &mut rng, file_name);
+    let size = usize::try_from(size).unwrap_or(usize::MAX);
+
+    if size == 0 {
+        return String::new();
+    }
+
+    let mut bytes = vec![0u8; size];
+    for byte in bytes.iter_mut() {
+        *byte = rng.gen_range(32u8..=126u8);
+    }
+
+    String::from_utf8(bytes).unwrap_or_default()
 }
 
 fn normalize_directory_path(path: &str) -> Option<String> {
@@ -230,6 +264,87 @@ fn directory_rng(seed: u64, path: &str, depth: usize) -> StdRng {
     StdRng::seed_from_u64(stable_hash(seed, path, depth as u64))
 }
 
+fn file_rng(seed: u64, path: &str, depth: usize, file_name: &str) -> StdRng {
+    let mut hash = stable_hash(seed, path, depth as u64);
+    for byte in file_name.as_bytes() {
+        hash ^= *byte as u64;
+        hash = hash.wrapping_mul(0x1000_0000_01b3);
+    }
+    StdRng::seed_from_u64(hash)
+}
+
+fn file_content_size(config: &Config, rng: &mut StdRng, file_name: &str) -> u64 {
+    let extension = file_extension(file_name);
+    let range = extension
+        .and_then(|ext| lookup_extension_range(&config.dictionary.files.extensions, ext))
+        .or_else(|| config.dictionary.files.extensions.values().next())
+        .expect("dictionary requires at least one extension");
+
+    let min_size = range.min_size.value();
+    let max_size = range.max_size.value();
+    if min_size >= max_size {
+        min_size
+    } else {
+        rng.gen_range(min_size..=max_size)
+    }
+}
+
+fn file_extension(file_name: &str) -> Option<&str> {
+    file_name.rsplit_once('.').map(|(_, ext)| ext.trim())
+}
+
+fn lookup_extension_range<'a>(
+    extensions: &'a BTreeMap<String, SizeRange>,
+    extension: &str,
+) -> Option<&'a SizeRange> {
+    if let Some(range) = extensions.get(extension) {
+        return Some(range);
+    }
+
+    let trimmed = extension.trim_start_matches('.');
+    if let Some(range) = extensions.get(trimmed) {
+        return Some(range);
+    }
+
+    let lower = trimmed.to_ascii_lowercase();
+    if let Some(range) = extensions.get(&lower) {
+        return Some(range);
+    }
+
+    let dotted = format!(".{trimmed}");
+    if let Some(range) = extensions.get(&dotted) {
+        return Some(range);
+    }
+
+    let dotted_lower = format!(".{lower}");
+    extensions.get(&dotted_lower)
+}
+
+fn generated_file_size(config: &Config, parent_path: &str, depth: usize, file_name: &str) -> u64 {
+    let mut rng = file_rng(config.seed, parent_path, depth, file_name);
+    file_content_size(config, &mut rng, file_name)
+}
+
+fn deterministic_modified_seconds(seed: u64, path: &str, depth: usize, name: &str) -> i64 {
+    let mut hash = stable_hash(seed, path, depth as u64);
+    for byte in name.as_bytes() {
+        hash ^= *byte as u64;
+        hash = hash.wrapping_mul(0x1000_0000_01b3);
+    }
+
+    let base_timestamp = 1_640_995_200u64; // 2022-01-01 00:00:00 UTC
+    let span_seconds = 3 * 365 * 24 * 60 * 60u64;
+    let offset = hash % span_seconds;
+    (base_timestamp + offset) as i64
+}
+
+fn system_time_to_unix_seconds(value: SystemTime) -> Option<i64> {
+    value
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .map(|duration| duration.as_secs() as i64)
+}
+
 fn stable_hash(seed: u64, path: &str, depth: u64) -> u64 {
     let mut hash = seed ^ 0x9e37_79b9_7f4a_7c15;
 
@@ -267,6 +382,8 @@ struct RealChildEntry {
     name: String,
     path: PathBuf,
     is_directory: bool,
+    size_bytes: Option<u64>,
+    modified_unix_seconds: Option<i64>,
 }
 
 fn real_children(source_path: &Path) -> Vec<RealChildEntry> {
@@ -289,10 +406,23 @@ fn real_children(source_path: &Path) -> Vec<RealChildEntry> {
             continue;
         };
 
+        let is_directory = metadata.is_dir();
+        let size_bytes = if is_directory {
+            None
+        } else {
+            Some(metadata.len())
+        };
+        let modified_unix_seconds = metadata
+            .modified()
+            .ok()
+            .and_then(system_time_to_unix_seconds);
+
         children.push(RealChildEntry {
             name,
             path,
-            is_directory: metadata.is_dir(),
+            is_directory,
+            size_bytes,
+            modified_unix_seconds,
         });
     }
 
@@ -341,6 +471,7 @@ mod tests {
             real_path: None,
             real_path_chance: 0.0,
             dictionary: default_dictionary(),
+            footer_signature: "rfs-webserver/test".to_string(),
         }
     }
 

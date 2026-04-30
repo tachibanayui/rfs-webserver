@@ -1,4 +1,6 @@
 use serde::Deserialize;
+use serde::de::{self, Deserializer};
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;
 
@@ -27,7 +29,72 @@ pub struct Dirs {
 #[derive(Debug, Clone, Deserialize)]
 pub struct Files {
     pub stems: Vec<String>,
-    pub extensions: Vec<String>,
+    pub extensions: BTreeMap<String, SizeRange>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SizeRange {
+    pub min_size: SizeSpec,
+    pub max_size: SizeSpec,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SizeSpec(u64);
+
+impl SizeSpec {
+    pub fn value(self) -> u64 {
+        self.0
+    }
+}
+
+impl<'de> Deserialize<'de> for SizeSpec {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct SizeSpecVisitor;
+
+        impl<'de> de::Visitor<'de> for SizeSpecVisitor {
+            type Value = SizeSpec;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+                formatter.write_str("a size like 1024, \"1KB\", or \"2MiB\"")
+            }
+
+            fn visit_u64<E>(self, value: u64) -> Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                Ok(SizeSpec(value))
+            }
+
+            fn visit_i64<E>(self, value: i64) -> Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                if value < 0 {
+                    return Err(E::custom("size must be non-negative"));
+                }
+                Ok(SizeSpec(value as u64))
+            }
+
+            fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                parse_size(value).map(SizeSpec).map_err(E::custom)
+            }
+
+            fn visit_string<E>(self, value: String) -> Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                parse_size(&value).map(SizeSpec).map_err(E::custom)
+            }
+        }
+
+        deserializer.deserialize_any(SizeSpecVisitor)
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -69,7 +136,7 @@ impl Dictionary {
         ensure_non_empty(&self.anchors.roots, "anchors.roots")?;
         ensure_non_empty(&self.dirs.common, "dirs.common")?;
         ensure_non_empty(&self.files.stems, "files.stems")?;
-        ensure_non_empty(&self.files.extensions, "files.extensions")?;
+        ensure_extension_ranges(&self.files.extensions)?;
         ensure_non_empty_id_formats(&self.ids.formats)?;
         Ok(())
     }
@@ -85,6 +152,76 @@ fn ensure_non_empty(values: &[String], field: &str) -> Result<(), String> {
     }
 
     Ok(())
+}
+
+fn ensure_extension_ranges(values: &BTreeMap<String, SizeRange>) -> Result<(), String> {
+    if values.is_empty() {
+        return Err("dictionary requires at least one extension in files.extensions".to_string());
+    }
+
+    for (extension, range) in values {
+        if extension.trim().is_empty() {
+            return Err("dictionary has empty extension keys in files.extensions".to_string());
+        }
+
+        let normalized = extension.trim_start_matches('.');
+        if normalized.is_empty() {
+            return Err("dictionary has invalid extension keys in files.extensions".to_string());
+        }
+
+        if range.min_size.value() > range.max_size.value() {
+            return Err(format!(
+                "files.extensions.{extension} has min_size greater than max_size"
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+fn parse_size(input: &str) -> Result<u64, String> {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return Err("size value cannot be empty".to_string());
+    }
+
+    let split_at = trimmed
+        .chars()
+        .position(|ch| !ch.is_ascii_digit())
+        .unwrap_or_else(|| trimmed.len());
+    let (value_part, suffix_part) = trimmed.split_at(split_at);
+    let value_str = value_part.trim();
+    let suffix_str = suffix_part.trim();
+
+    if value_str.is_empty() {
+        return Err(format!("invalid size number: {trimmed}"));
+    }
+
+    let value: u64 = value_str
+        .parse()
+        .map_err(|_| format!("invalid size number: {value_str}"))?;
+
+    if suffix_str.is_empty() {
+        return Ok(value);
+    }
+
+    let suffix = suffix_str
+        .replace(char::is_whitespace, "")
+        .to_ascii_uppercase();
+    let multiplier = match suffix.as_str() {
+        "B" => 1,
+        "KB" => 1_000,
+        "KIB" => 1_024,
+        "MB" => 1_000_000,
+        "MIB" => 1_048_576,
+        _ => {
+            return Err(format!("unknown size suffix: {suffix_str}"));
+        }
+    };
+
+    value
+        .checked_mul(multiplier)
+        .ok_or_else(|| "size value is too large".to_string())
 }
 
 fn ensure_non_empty_id_formats(values: &[IdFormat]) -> Result<(), String> {
@@ -148,13 +285,43 @@ pub fn default_dictionary() -> Dictionary {
                 "statement".to_string(),
                 "ledger".to_string(),
             ],
-            extensions: vec![
-                "json".to_string(),
-                "csv".to_string(),
-                "pdf".to_string(),
-                "txt".to_string(),
-                "log".to_string(),
-            ],
+            extensions: BTreeMap::from([
+                (
+                    "json".to_string(),
+                    SizeRange {
+                        min_size: SizeSpec(256),
+                        max_size: SizeSpec(8 * 1024),
+                    },
+                ),
+                (
+                    "csv".to_string(),
+                    SizeRange {
+                        min_size: SizeSpec(256),
+                        max_size: SizeSpec(16 * 1024),
+                    },
+                ),
+                (
+                    "pdf".to_string(),
+                    SizeRange {
+                        min_size: SizeSpec(4 * 1024),
+                        max_size: SizeSpec(256 * 1024),
+                    },
+                ),
+                (
+                    "txt".to_string(),
+                    SizeRange {
+                        min_size: SizeSpec(128),
+                        max_size: SizeSpec(4 * 1024),
+                    },
+                ),
+                (
+                    "log".to_string(),
+                    SizeRange {
+                        min_size: SizeSpec(512),
+                        max_size: SizeSpec(64 * 1024),
+                    },
+                ),
+            ]),
         },
         ids: Ids {
             formats: vec![
@@ -187,7 +354,7 @@ common = ["orders", "users"]
 
 [files]
 stems = ["order"]
-extensions = ["json"]
+extensions = { json = { min_size = "1KB", max_size = "4KB" } }
 
 [ids]
 formats = ["numeric"]
@@ -195,6 +362,50 @@ formats = ["numeric"]
 
         let dictionary = Dictionary::from_toml_str(input).expect("dictionary should parse");
         assert_eq!(dictionary.anchors.roots.len(), 2);
-        assert_eq!(dictionary.files.extensions[0], "json");
+        assert!(dictionary.files.extensions.contains_key("json"));
+    }
+
+    #[test]
+    fn size_parses_with_suffixes() {
+        let input = r#"
+[anchors]
+roots = ["etc"]
+
+[dirs]
+common = ["orders"]
+
+[files]
+stems = ["order"]
+extensions = { json = { min_size = "1KB", max_size = "2MiB" } }
+
+[ids]
+formats = ["numeric"]
+"#;
+
+        let dictionary = Dictionary::from_toml_str(input).expect("dictionary should parse");
+        let range = dictionary.files.extensions.get("json").expect("range");
+        assert_eq!(range.min_size.value(), 1_000);
+        assert_eq!(range.max_size.value(), 2_097_152);
+    }
+
+    #[test]
+    fn size_range_requires_min_leq_max() {
+        let input = r#"
+[anchors]
+roots = ["etc"]
+
+[dirs]
+common = ["orders"]
+
+[files]
+stems = ["order"]
+extensions = { json = { min_size = "10KB", max_size = "1KB" } }
+
+[ids]
+formats = ["numeric"]
+"#;
+
+        let error = Dictionary::from_toml_str(input).expect_err("should fail");
+        assert!(error.contains("min_size"));
     }
 }

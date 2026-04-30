@@ -4,43 +4,62 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use clap::Parser;
 
-use crate::dictionary::{default_dictionary, Dictionary};
+use crate::dictionary::{Dictionary, default_dictionary};
 
 #[derive(Debug, Clone, Parser)]
 #[command(author, version, about = "Random virtual filesystem webserver")]
 pub struct Args {
-    #[arg(long, default_value = "127.0.0.1")]
+    /// Bind address, default: 0.0.0.0
+    #[arg(long, default_value = "0.0.0.0")]
     pub host: Ipv4Addr,
 
+    /// TCP port, default: 3000
     #[arg(short, long, default_value_t = 3000)]
     pub port: u16,
 
+    /// Optional base seed for deterministic generation
     #[arg(long)]
     pub seed: Option<u64>,
 
+    /// Maximum directory depth
     #[arg(long, default_value_t = 10)]
     pub depth: usize,
 
+    /// Minimum files per directory
     #[arg(long, default_value_t = 10)]
     pub min_files: usize,
 
+    /// Maximum files per directory
     #[arg(long, default_value_t = 100)]
     pub max_files: usize,
 
+    /// Minimum subdirectories per directory
     #[arg(long, default_value_t = 0)]
     pub min_dirs: usize,
 
+    /// Maximum subdirectories per directory
     #[arg(long, default_value_t = 100)]
     pub max_dirs: usize,
 
+    /// Optional on-disk directory used as a source of real entries
     #[arg(long, default_value = "./real-path")]
     pub real_path: Option<PathBuf>,
 
+    /// Probability in the range 0..1 for including a real entry
     #[arg(long, default_value_t = 1.0)]
     pub real_path_chance: f64,
 
+    /// Optional TOML dictionary to override the default naming lists
     #[arg(long)]
     pub dictionary: Option<PathBuf>,
+
+    /// Footer signature text for directory listings
+    #[arg(
+        long,
+        default_value = concat!("rfs-webserver/", env!("CARGO_PKG_VERSION")),
+        help = "Footer signature text for directory listings"
+    )]
+    pub footer_signature: String,
 }
 
 #[derive(Debug, Clone)]
@@ -56,6 +75,7 @@ pub struct Config {
     pub real_path: Option<PathBuf>,
     pub real_path_chance: f64,
     pub dictionary: Dictionary,
+    pub footer_signature: String,
 }
 
 impl Args {
@@ -94,6 +114,7 @@ impl Args {
             real_path,
             real_path_chance: self.real_path_chance,
             dictionary,
+            footer_signature: self.footer_signature,
         })
     }
 }
@@ -150,6 +171,7 @@ mod tests {
             real_path: None,
             real_path_chance: 1.5,
             dictionary: None,
+            footer_signature: "rfs-webserver/0.1.0".to_string(),
         };
 
         assert!(args.into_config().is_err());
@@ -170,6 +192,7 @@ mod tests {
             real_path: Some(dir.clone()),
             real_path_chance: 0.5,
             dictionary: None,
+            footer_signature: "rfs-webserver/0.1.0".to_string(),
         };
 
         let config = args.into_config().expect("config should validate");

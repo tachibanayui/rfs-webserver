@@ -22,7 +22,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let args = Args::parse();
     let config = args.into_config()?;
     let filesystem = vfs::generator::generate(&config);
-    let app: Router = routes::router(filesystem);
+    let app: Router = routes::router(filesystem, config.footer_signature.clone());
 
     let address: SocketAddr = format!("{}:{}", config.host, config.port).parse()?;
     let listener = tokio::net::TcpListener::bind(address).await?;

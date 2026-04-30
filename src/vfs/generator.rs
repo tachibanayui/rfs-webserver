@@ -25,6 +25,7 @@ mod tests {
             real_path: None,
             real_path_chance: 0.0,
             dictionary: default_dictionary(),
+            footer_signature: "rfs-webserver/test".to_string(),
         });
 
         assert!(filesystem.root_listing().children.len() >= 2);
@@ -44,6 +45,7 @@ mod tests {
             real_path: None,
             real_path_chance: 0.0,
             dictionary: default_dictionary(),
+            footer_signature: "rfs-webserver/test".to_string(),
         };
 
         let first = generate(&config);

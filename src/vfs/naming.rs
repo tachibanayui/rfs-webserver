@@ -22,7 +22,8 @@ impl<'a> NameGenerator<'a> {
 
     pub fn file_name(&self, rng: &mut StdRng) -> String {
         let stem = pick_from(rng, &self.dictionary.files.stems);
-        let extension = pick_from(rng, &self.dictionary.files.extensions);
+        let extensions: Vec<&String> = self.dictionary.files.extensions.keys().collect();
+        let extension = pick_from(rng, &extensions);
         let normalized_ext = extension.trim_start_matches('.');
         let id = self.generate_id(rng);
 

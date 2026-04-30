@@ -8,7 +8,7 @@ The filesystem is generated on demand from a seed and the current request path. 
 
 - Deterministic virtual filesystem generation from a seed.
 - Optional seed fallback to the current system time.
-- HTML directory listings with simple browser-like navigation.
+- Apache-style HTML directory listings with icons, last-modified, and size columns.
 - Plain text file responses for generated file paths.
 - Clap-based command-line configuration with sensible defaults.
 - Optional real-path overlay sampling from an on-disk directory tree.
@@ -26,12 +26,12 @@ Start the server with the default configuration:
 cargo run
 ```
 
-By default the server listens on `127.0.0.1:3000`.
+By default the server listens on `0.0.0.0:3000`.
 
 ## CLI Options
 
 ```text
---host <HOST>         Bind address, default: 127.0.0.1
+--host <HOST>         Bind address, default: 0.0.0.0
 -p, --port <PORT>     TCP port, default: 3000
 --seed <SEED>         Optional base seed for deterministic generation
 --depth <DEPTH>       Maximum directory depth, default: 10
@@ -42,6 +42,7 @@ By default the server listens on `127.0.0.1:3000`.
 --real-path <PATH>    Optional on-disk directory used as a source of real entries
 --real-path-chance <P> Probability in the range 0..1 for including a real entry, default: 0
 --dictionary <PATH>   Optional TOML dictionary to override the default naming lists
+--footer-signature <TEXT> Footer signature text, default: rfs-webserver/<version>
 ```
 
 If `--seed` is not provided, the server uses the current system time as the effective seed.
@@ -101,8 +102,26 @@ deep = ["2026", "2025", "04", "05", "daily", "monthly", "regional"]
 [files]
 # Base names for files; an ID is appended.
 stems = ["order", "invoice", "user", "receipt", "export", "report"]
-# File extensions, without dots.
-extensions = ["json", "csv", "pdf", "txt", "log"]
+# File extensions with size ranges.
+[files.extensions."json"]
+min_size = "1KB"
+max_size = "8KB"
+
+[files.extensions."csv"]
+min_size = "1KB"
+max_size = "16KB"
+
+[files.extensions."pdf"]
+min_size = "4KB"
+max_size = "256KB"
+
+[files.extensions."txt"]
+min_size = "128B"
+max_size = "4KB"
+
+[files.extensions."log"]
+min_size = "512B"
+max_size = "64KB"
 
 [ids]
 # Allowed ID formats for suffixes.
@@ -129,7 +148,7 @@ Directory requests render an HTML listing page with links to child directories a
 
 - Directory listings are generated from the effective seed and the request path.
 - The same seed and configuration produce the same paths and file content.
-- Directories are rendered as HTML pages with a simple mirror/index style layout.
+- Directories are rendered as Apache-style index pages with icon, date, and size columns.
 - Files are generated lazily when requested, so the server does not need to store the entire tree.
 - When `--real-path` is set, some directory entries may come from the configured on-disk tree.
 - Real directories recurse and real files return their actual file contents.
