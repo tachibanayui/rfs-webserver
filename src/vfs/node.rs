@@ -1,9 +1,11 @@
 use rand::rngs::StdRng;
 use rand::{Rng, RngCore, SeedableRng};
+use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
 use crate::cli::Config;
+use crate::vfs::naming::NameGenerator;
 
 #[derive(Debug, Clone)]
 pub struct VirtualFilesystem {
@@ -94,10 +96,12 @@ fn build_listing(
         // Otherwise, generate synthetic VFS entries
         let mut rng = directory_rng(config.seed, path, depth);
 
+        let name_generator = NameGenerator::new(&config.dictionary);
+        let mut used_names = HashSet::new();
+
         let file_count = rng.gen_range(config.min_files..=config.max_files);
-        for index in 0..file_count {
-            let unique = random_suffix(&mut rng);
-            let name = format!("file-{}-{}-{}.txt", depth, index, unique);
+        for _ in 0..file_count {
+            let name = unique_name(&mut rng, &mut used_names, |rng| name_generator.file_name(rng));
             children.push(ChildEntry {
                 name: name.clone(),
                 path: join_path(path, &name),
@@ -108,9 +112,10 @@ fn build_listing(
 
         if depth < config.depth {
             let directory_count = rng.gen_range(config.min_dirs..=config.max_dirs);
-            for index in 0..directory_count {
-                let unique = random_suffix(&mut rng);
-                let name = format!("dir-{}-{}-{}", depth, index, unique);
+            for _ in 0..directory_count {
+                let name = unique_name(&mut rng, &mut used_names, |rng| {
+                    name_generator.directory_name(rng, depth)
+                });
                 children.push(ChildEntry {
                     name: name.clone(),
                     path: join_path(path, &name),
@@ -241,6 +246,22 @@ fn random_suffix(rng: &mut StdRng) -> String {
     format!("{:08x}", rng.next_u32())
 }
 
+fn unique_name<F>(rng: &mut StdRng, used: &mut HashSet<String>, mut create: F) -> String
+where
+    F: FnMut(&mut StdRng) -> String,
+{
+    for _ in 0..10 {
+        let candidate = create(rng);
+        if used.insert(candidate.clone()) {
+            return candidate;
+        }
+    }
+
+    let fallback = format!("{}-{}", create(rng), random_suffix(rng));
+    used.insert(fallback.clone());
+    fallback
+}
+
 #[derive(Debug, Clone)]
 struct RealChildEntry {
     name: String,
@@ -282,6 +303,7 @@ fn real_children(source_path: &Path) -> Vec<RealChildEntry> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::dictionary::default_dictionary;
 
     fn temp_dir(name: &str) -> PathBuf {
         let unique = format!(
@@ -318,6 +340,7 @@ mod tests {
             max_dirs: 2,
             real_path: None,
             real_path_chance: 0.0,
+            dictionary: default_dictionary(),
         }
     }
 
@@ -372,6 +395,19 @@ mod tests {
                 .children
                 .iter()
                 .all(|child| !child.is_directory)
+        );
+    }
+
+    #[test]
+    fn generated_names_are_not_template_like() {
+        let filesystem = VirtualFilesystem::new(config());
+        let root = filesystem.root_listing();
+
+        assert!(
+            !root
+                .children
+                .iter()
+                .any(|child| child.name.starts_with("dir-") || child.name.starts_with("file-"))
         );
     }
 

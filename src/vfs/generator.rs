@@ -9,6 +9,7 @@ pub fn generate(config: &Config) -> VirtualFilesystem {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::dictionary::default_dictionary;
 
     #[test]
     fn generation_keeps_only_configuration_state() {
@@ -23,6 +24,7 @@ mod tests {
             max_dirs: 2,
             real_path: None,
             real_path_chance: 0.0,
+            dictionary: default_dictionary(),
         });
 
         assert!(filesystem.root_listing().children.len() >= 2);
@@ -41,6 +43,7 @@ mod tests {
             max_dirs: 2,
             real_path: None,
             real_path_chance: 0.0,
+            dictionary: default_dictionary(),
         };
 
         let first = generate(&config);

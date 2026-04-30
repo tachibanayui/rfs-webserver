@@ -4,6 +4,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use clap::Parser;
 
+use crate::dictionary::{default_dictionary, Dictionary};
+
 #[derive(Debug, Clone, Parser)]
 #[command(author, version, about = "Random virtual filesystem webserver")]
 pub struct Args {
@@ -36,6 +38,9 @@ pub struct Args {
 
     #[arg(long, default_value_t = 1.0)]
     pub real_path_chance: f64,
+
+    #[arg(long)]
+    pub dictionary: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone)]
@@ -50,6 +55,7 @@ pub struct Config {
     pub max_dirs: usize,
     pub real_path: Option<PathBuf>,
     pub real_path_chance: f64,
+    pub dictionary: Dictionary,
 }
 
 impl Args {
@@ -71,6 +77,10 @@ impl Args {
             Some(path) => Some(validate_real_path(path)?),
             None => None,
         };
+        let dictionary = match self.dictionary {
+            Some(path) => Dictionary::from_path(&path)?,
+            None => default_dictionary(),
+        };
 
         Ok(Config {
             host: self.host,
@@ -83,6 +93,7 @@ impl Args {
             max_dirs: self.max_dirs,
             real_path,
             real_path_chance: self.real_path_chance,
+            dictionary,
         })
     }
 }
@@ -138,6 +149,7 @@ mod tests {
             max_dirs: 1,
             real_path: None,
             real_path_chance: 1.5,
+            dictionary: None,
         };
 
         assert!(args.into_config().is_err());
@@ -157,6 +169,7 @@ mod tests {
             max_dirs: 1,
             real_path: Some(dir.clone()),
             real_path_chance: 0.5,
+            dictionary: None,
         };
 
         let config = args.into_config().expect("config should validate");
