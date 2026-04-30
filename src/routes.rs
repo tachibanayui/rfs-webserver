@@ -1,8 +1,10 @@
 use axum::Router;
+use axum::body::Body;
 use axum::extract::{Path, State};
 use axum::http::{HeaderValue, StatusCode, header};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::get;
+use std::time::Duration;
 use time::OffsetDateTime;
 use time::format_description::{self, FormatItem};
 
@@ -12,19 +14,28 @@ use crate::vfs::VirtualFilesystem;
 pub struct AppState {
     pub filesystem: VirtualFilesystem,
     pub footer_signature: String,
+    pub delay: Option<Duration>,
 }
 
-pub fn router(filesystem: VirtualFilesystem, footer_signature: String) -> Router {
+pub fn router(
+    filesystem: VirtualFilesystem,
+    footer_signature: String,
+    delay: Option<Duration>,
+) -> Router {
     Router::new()
         .route("/", get(root))
         .route("/{*path}", get(path_handler))
         .with_state(AppState {
             filesystem,
             footer_signature,
+            delay,
         })
 }
 
 async fn root(State(state): State<AppState>) -> Html<String> {
+    if let Some(delay) = state.delay {
+        tokio::time::sleep(delay).await;
+    }
     Html(render_directory_page(
         "/",
         None,
@@ -36,6 +47,10 @@ async fn root(State(state): State<AppState>) -> Html<String> {
 async fn path_handler(State(state): State<AppState>, Path(path): Path<String>) -> Response {
     let normalized = normalize_path(&path);
 
+    if let Some(delay) = state.delay {
+        tokio::time::sleep(delay).await;
+    }
+
     if let Some(directory) = state.filesystem.directory_listing(&normalized) {
         Html(render_directory_page(
             &directory.path,
@@ -44,14 +59,19 @@ async fn path_handler(State(state): State<AppState>, Path(path): Path<String>) -
             &state.footer_signature,
         ))
         .into_response()
-    } else if let Some(file) = state.filesystem.file_entry(&normalized) {
+    } else if let Some(file) = state.filesystem.file_entry(&normalized).await {
         let file_name = file_name_for_download(&normalized).unwrap_or("download".to_string());
-        let mut response = (
-            StatusCode::OK,
-            [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
-            file.content,
-        )
-            .into_response();
+        let mut response = Response::new(Body::from_stream(file.stream));
+        *response.status_mut() = StatusCode::OK;
+        response.headers_mut().insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("text/plain; charset=utf-8"),
+        );
+        if let Some(size) = file.size_bytes {
+            if let Ok(value) = HeaderValue::from_str(&size.to_string()) {
+                response.headers_mut().insert(header::CONTENT_LENGTH, value);
+            }
+        }
         let disposition = format!("attachment; filename=\"{}\"", sanitize_filename(&file_name));
         if let Ok(value) = HeaderValue::from_str(&disposition) {
             response

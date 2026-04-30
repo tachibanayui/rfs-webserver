@@ -24,8 +24,10 @@ mod tests {
             max_dirs: 2,
             real_path: None,
             real_path_chance: 0.0,
+            allow_symlink: false,
             dictionary: default_dictionary(),
             footer_signature: "rfs-webserver/test".to_string(),
+            delay: None,
         });
 
         assert!(filesystem.root_listing().children.len() >= 2);
@@ -44,8 +46,10 @@ mod tests {
             max_dirs: 2,
             real_path: None,
             real_path_chance: 0.0,
+            allow_symlink: false,
             dictionary: default_dictionary(),
             footer_signature: "rfs-webserver/test".to_string(),
+            delay: None,
         };
 
         let first = generate(&config);

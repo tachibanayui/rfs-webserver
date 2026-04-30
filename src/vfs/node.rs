@@ -1,9 +1,13 @@
+use bytes::Bytes;
+use futures::stream::{self, BoxStream};
 use rand::rngs::StdRng;
 use rand::{Rng, RngCore, SeedableRng};
 use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
+use tokio::fs::File;
+use tokio_util::io::ReaderStream;
 
 use crate::cli::Config;
 use crate::dictionary::SizeRange;
@@ -30,10 +34,12 @@ pub struct DirectoryListing {
     pub children: Vec<ChildEntry>,
 }
 
-#[derive(Debug, Clone)]
 pub struct FileEntry {
-    pub content: String,
+    pub stream: BoxStream<'static, Result<Bytes, std::io::Error>>,
+    pub size_bytes: Option<u64>,
 }
+
+const GENERATED_CHUNK_SIZE: usize = 16 * 1024;
 
 impl VirtualFilesystem {
     pub fn new(config: Config) -> Self {
@@ -51,7 +57,7 @@ impl VirtualFilesystem {
         resolve_directory_path(&self.config, &segments)
     }
 
-    pub fn file_entry(&self, path: &str) -> Option<FileEntry> {
+    pub async fn file_entry(&self, path: &str) -> Option<FileEntry> {
         let normalized = normalize_file_path(path)?;
         let segments = path_segments(&normalized);
         let (file_name, parent_segments) = segments.split_last()?;
@@ -63,17 +69,28 @@ impl VirtualFilesystem {
             .into_iter()
             .find(|child| !child.is_directory && child.name == *file_name)?;
 
-        Some(FileEntry {
-            content: match child.source_path {
-                Some(source_path) => fs::read_to_string(source_path).ok()?,
-                None => render_file_content(
+        match child.source_path {
+            Some(source_path) => {
+                let file = File::open(&source_path).await.ok()?;
+                let stream = Box::pin(ReaderStream::new(file));
+                Some(FileEntry {
+                    stream,
+                    size_bytes: child.size_bytes,
+                })
+            }
+            None => {
+                let (stream, size_bytes) = generated_file_stream(
                     &self.config,
                     &parent_path,
                     file_name,
                     parent_segments.len(),
-                ),
-            },
-        })
+                );
+                Some(FileEntry {
+                    stream,
+                    size_bytes: Some(size_bytes),
+                })
+            }
+        }
     }
 }
 
@@ -87,7 +104,7 @@ fn build_listing(
 
     // If we're inside a mounted real directory, list its actual contents
     if let Some(source_path) = source_path.as_ref() {
-        for real_child in real_children(source_path) {
+        for real_child in real_children(source_path, config.allow_symlink) {
             let child_path = join_path(path, &real_child.name);
             children.push(ChildEntry {
                 name: real_child.name,
@@ -151,7 +168,7 @@ fn build_listing(
         if path == "/" && config.real_path.is_some() {
             let mut rng = directory_rng(config.seed, path, depth);
             if let Some(real_root) = config.real_path.as_ref() {
-                for real_child in real_children(real_root) {
+                for real_child in real_children(real_root, config.allow_symlink) {
                     if !rng.gen_bool(config.real_path_chance) {
                         continue;
                     }
@@ -197,26 +214,32 @@ fn resolve_directory_path(config: &Config, segments: &[&str]) -> Option<Director
     Some(build_listing(config, &current_path, depth, source_path))
 }
 
-fn render_file_content(
+fn generated_file_stream(
     config: &Config,
     parent_path: &str,
     file_name: &str,
     depth: usize,
-) -> String {
+) -> (BoxStream<'static, Result<Bytes, std::io::Error>>, u64) {
     let mut rng = file_rng(config.seed, parent_path, depth, file_name);
-    let size = file_content_size(config, &mut rng, file_name);
-    let size = usize::try_from(size).unwrap_or(usize::MAX);
+    let size_bytes = file_content_size(config, &mut rng, file_name);
+    let stream = stream::unfold((rng, size_bytes), |(mut rng, remaining)| async move {
+        if remaining == 0 {
+            return None;
+        }
 
-    if size == 0 {
-        return String::new();
-    }
+        let chunk_len = if remaining < GENERATED_CHUNK_SIZE as u64 {
+            remaining as usize
+        } else {
+            GENERATED_CHUNK_SIZE
+        };
+        let mut bytes = vec![0u8; chunk_len];
+        for byte in bytes.iter_mut() {
+            *byte = rng.gen_range(32u8..=126u8);
+        }
+        Some((Ok(Bytes::from(bytes)), (rng, remaining - chunk_len as u64)))
+    });
 
-    let mut bytes = vec![0u8; size];
-    for byte in bytes.iter_mut() {
-        *byte = rng.gen_range(32u8..=126u8);
-    }
-
-    String::from_utf8(bytes).unwrap_or_default()
+    (Box::pin(stream), size_bytes)
 }
 
 fn normalize_directory_path(path: &str) -> Option<String> {
@@ -386,7 +409,7 @@ struct RealChildEntry {
     modified_unix_seconds: Option<i64>,
 }
 
-fn real_children(source_path: &Path) -> Vec<RealChildEntry> {
+fn real_children(source_path: &Path, allow_symlink: bool) -> Vec<RealChildEntry> {
     let mut children = Vec::new();
 
     let Ok(entries) = fs::read_dir(source_path) else {
@@ -394,6 +417,14 @@ fn real_children(source_path: &Path) -> Vec<RealChildEntry> {
     };
 
     for entry in entries.flatten() {
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+
+        if !allow_symlink && file_type.is_symlink() {
+            continue;
+        }
+
         let Ok(metadata) = entry.metadata() else {
             continue;
         };
@@ -434,6 +465,7 @@ fn real_children(source_path: &Path) -> Vec<RealChildEntry> {
 mod tests {
     use super::*;
     use crate::dictionary::default_dictionary;
+    use futures::StreamExt;
 
     fn temp_dir(name: &str) -> PathBuf {
         let unique = format!(
@@ -470,8 +502,10 @@ mod tests {
             max_dirs: 2,
             real_path: None,
             real_path_chance: 0.0,
+            allow_symlink: false,
             dictionary: default_dictionary(),
             footer_signature: "rfs-webserver/test".to_string(),
+            delay: None,
         }
     }
 
@@ -542,8 +576,17 @@ mod tests {
         );
     }
 
-    #[test]
-    fn real_entries_are_included_and_real_files_return_real_content() {
+    async fn read_stream_to_string(mut stream: FileEntry) -> String {
+        let mut bytes = Vec::new();
+        while let Some(chunk) = stream.stream.next().await {
+            let chunk = chunk.expect("stream chunk should be readable");
+            bytes.extend_from_slice(&chunk);
+        }
+        String::from_utf8(bytes).unwrap_or_default()
+    }
+
+    #[tokio::test]
+    async fn real_entries_are_included_and_real_files_return_real_content() {
         let source = temp_dir("real-entries");
         write_file(&source.join("alpha.txt"), "alpha contents");
         write_file(&source.join("nested").join("child.txt"), "nested contents");
@@ -571,9 +614,10 @@ mod tests {
 
         let file = filesystem
             .file_entry(&alpha.path)
+            .await
             .expect("real file should resolve");
 
-        assert_eq!(file.content, "alpha contents");
+        assert_eq!(read_stream_to_string(file).await, "alpha contents");
 
         let nested_listing = filesystem
             .directory_listing(&nested.path)
@@ -587,9 +631,10 @@ mod tests {
 
         let nested_file = filesystem
             .file_entry(&child.path)
+            .await
             .expect("nested real file should resolve");
 
-        assert_eq!(nested_file.content, "nested contents");
+        assert_eq!(read_stream_to_string(nested_file).await, "nested contents");
     }
 
     #[test]

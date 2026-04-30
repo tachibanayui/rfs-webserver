@@ -6,13 +6,14 @@ The filesystem is generated on demand from a seed and the current request path. 
 
 ## Features
 
-- Deterministic virtual filesystem generation from a seed.
+- Deterministic virtual filesystem generation from a seed. Directory and file content are generated from the effective seed and the request path.
+- Files are generated lazily when requested, so the server does not need to store the entire tree.
 - Optional seed fallback to the current system time.
 - Apache-style HTML directory listings with icons, last-modified, and size columns.
 - Plain text file responses for generated file paths.
 - Clap-based command-line configuration with sensible defaults.
-- Optional real-path overlay sampling from an on-disk directory tree.
-- Optional TOML dictionary to override default Linux + e-commerce naming.
+- Optional real-path overlay sampling from an on-disk directory tree. When `--real-path` is set, some directory entries may come from the configured on-disk tree.
+- Optional TOML dictionary to override default Linux + e-commerce naming. When `--dictionary` is set, the default Linux + e-commerce naming lists are replaced by the contents of the TOML file.
 
 ## Requirements
 
@@ -43,6 +44,7 @@ By default the server listens on `0.0.0.0:3000`.
 --real-path-chance <P> Probability in the range 0..1 for including a real entry, default: 0
 --dictionary <PATH>   Optional TOML dictionary to override the default naming lists
 --footer-signature <TEXT> Footer signature text, default: rfs-webserver/<version>
+--delay-ms <MS>       Artificial delay in milliseconds applied per request
 ```
 
 If `--seed` is not provided, the server uses the current system time as the effective seed.
@@ -143,36 +145,3 @@ http://127.0.0.1:3000/
 ```
 
 Directory requests render an HTML listing page with links to child directories and files. File requests return plain text content.
-
-## Behavior
-
-- Directory listings are generated from the effective seed and the request path.
-- The same seed and configuration produce the same paths and file content.
-- Directories are rendered as Apache-style index pages with icon, date, and size columns.
-- Files are generated lazily when requested, so the server does not need to store the entire tree.
-- When `--real-path` is set, some directory entries may come from the configured on-disk tree.
-- Real directories recurse and real files return their actual file contents.
-- When `--dictionary` is set, the default Linux + e-commerce naming lists are replaced by the
-  contents of the TOML file.
-
-## Project Layout
-
-- `src/main.rs` - application entrypoint and server startup
-- `src/cli.rs` - clap argument parsing and configuration validation
-- `src/routes.rs` - axum routes and HTML rendering
-- `src/vfs/node.rs` - on-demand virtual filesystem generation and lookup logic
-- `src/vfs/generator.rs` - lightweight wrapper that builds the runtime filesystem state
-
-## Development
-
-Run the test suite:
-
-```bash
-cargo test
-```
-
-Check the project:
-
-```bash
-cargo check
-```

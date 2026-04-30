@@ -1,6 +1,6 @@
 use std::net::Ipv4Addr;
 use std::path::PathBuf;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use clap::Parser;
 
@@ -45,6 +45,10 @@ pub struct Args {
     #[arg(long, default_value = "./real-path")]
     pub real_path: Option<PathBuf>,
 
+    /// Allow symlinks to be served from real-path
+    #[arg(long, default_value_t = false)]
+    pub allow_symlink: bool,
+
     /// Probability in the range 0..1 for including a real entry
     #[arg(long, default_value_t = 1.0)]
     pub real_path_chance: f64,
@@ -60,6 +64,10 @@ pub struct Args {
         help = "Footer signature text for directory listings"
     )]
     pub footer_signature: String,
+
+    /// Artificial delay in milliseconds applied per request
+    #[arg(long)]
+    pub delay_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone)]
@@ -74,8 +82,10 @@ pub struct Config {
     pub max_dirs: usize,
     pub real_path: Option<PathBuf>,
     pub real_path_chance: f64,
+    pub allow_symlink: bool,
     pub dictionary: Dictionary,
     pub footer_signature: String,
+    pub delay: Option<Duration>,
 }
 
 impl Args {
@@ -113,8 +123,10 @@ impl Args {
             max_dirs: self.max_dirs,
             real_path,
             real_path_chance: self.real_path_chance,
+            allow_symlink: self.allow_symlink,
             dictionary,
             footer_signature: self.footer_signature,
+            delay: self.delay_ms.map(Duration::from_millis),
         })
     }
 }
@@ -170,8 +182,10 @@ mod tests {
             max_dirs: 1,
             real_path: None,
             real_path_chance: 1.5,
+            allow_symlink: false,
             dictionary: None,
             footer_signature: "rfs-webserver/0.1.0".to_string(),
+            delay_ms: None,
         };
 
         assert!(args.into_config().is_err());
@@ -191,8 +205,10 @@ mod tests {
             max_dirs: 1,
             real_path: Some(dir.clone()),
             real_path_chance: 0.5,
+            allow_symlink: false,
             dictionary: None,
             footer_signature: "rfs-webserver/0.1.0".to_string(),
+            delay_ms: None,
         };
 
         let config = args.into_config().expect("config should validate");
