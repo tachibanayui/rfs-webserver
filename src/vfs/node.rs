@@ -1,9 +1,11 @@
 use bytes::Bytes;
 use futures::stream::{self, BoxStream};
-use rand::rngs::StdRng;
-use rand::{Rng, RngCore, SeedableRng};
+use rand::RngExt;
+use rand_xoshiro::Xoshiro256Plus;
+use rand_xoshiro::rand_core::{Rng, SeedableRng};
 use std::collections::{BTreeMap, HashSet};
 use std::fs;
+use std::marker::PhantomData;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::fs::File;
@@ -14,8 +16,9 @@ use crate::dictionary::SizeRange;
 use crate::vfs::naming::NameGenerator;
 
 #[derive(Debug, Clone)]
-pub struct VirtualFilesystem {
+pub struct VirtualFilesystem<R = Xoshiro256Plus> {
     config: Config,
+    _rng: PhantomData<R>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -41,11 +44,10 @@ pub struct FileEntry {
 
 const GENERATED_CHUNK_SIZE: usize = 16 * 1024;
 
-impl VirtualFilesystem {
-    pub fn new(config: Config) -> Self {
-        Self { config }
-    }
-
+impl<R> VirtualFilesystem<R>
+where
+    R: Rng + SeedableRng + Send + 'static,
+{
     pub fn root_listing(&self) -> DirectoryListing {
         self.directory_listing("/")
             .expect("root directory must always exist")
@@ -54,7 +56,7 @@ impl VirtualFilesystem {
     pub fn directory_listing(&self, path: &str) -> Option<DirectoryListing> {
         let normalized = normalize_directory_path(path)?;
         let segments = path_segments(&normalized);
-        resolve_directory_path(&self.config, &segments)
+        resolve_directory_path::<R>(&self.config, &segments)
     }
 
     pub async fn file_entry(&self, path: &str) -> Option<FileEntry> {
@@ -79,7 +81,7 @@ impl VirtualFilesystem {
                 })
             }
             None => {
-                let (stream, size_bytes) = generated_file_stream(
+                let (stream, size_bytes) = generated_file_stream::<R>(
                     &self.config,
                     &parent_path,
                     file_name,
@@ -94,12 +96,24 @@ impl VirtualFilesystem {
     }
 }
 
-fn build_listing(
+impl VirtualFilesystem<Xoshiro256Plus> {
+    pub fn new(config: Config) -> Self {
+        Self {
+            config,
+            _rng: PhantomData,
+        }
+    }
+}
+
+fn build_listing<R>(
     config: &Config,
     path: &str,
     depth: usize,
     source_path: Option<PathBuf>,
-) -> DirectoryListing {
+) -> DirectoryListing
+where
+    R: Rng + SeedableRng + Send,
+{
     let mut children = Vec::new();
 
     // If we're inside a mounted real directory, list its actual contents
@@ -117,12 +131,12 @@ fn build_listing(
         }
     } else {
         // Otherwise, generate synthetic VFS entries
-        let mut rng = directory_rng(config.seed, path, depth);
+        let mut rng = directory_rng::<R>(config.seed, path, depth);
 
-        let name_generator = NameGenerator::new(&config.dictionary);
+        let name_generator = NameGenerator::<R>::new(&config.dictionary);
         let mut used_names = HashSet::new();
 
-        let file_count = rng.gen_range(config.min_files..=config.max_files);
+        let file_count = rng.random_range(config.min_files..=config.max_files);
         for _ in 0..file_count {
             let name = unique_name(&mut rng, &mut used_names, |rng| {
                 name_generator.file_name(rng)
@@ -143,7 +157,7 @@ fn build_listing(
         }
 
         if depth < config.depth {
-            let directory_count = rng.gen_range(config.min_dirs..=config.max_dirs);
+            let directory_count = rng.random_range(config.min_dirs..=config.max_dirs);
             for _ in 0..directory_count {
                 let name = unique_name(&mut rng, &mut used_names, |rng| {
                     name_generator.directory_name(rng, depth)
@@ -165,10 +179,10 @@ fn build_listing(
         }
 
         if config.real_path.is_some() {
-            let mut rng = directory_rng(config.seed, path, depth);
+            let mut rng = directory_rng::<R>(config.seed, path, depth);
             if let Some(real_root) = config.real_path.as_ref() {
                 for real_child in real_children(real_root, config.allow_symlink) {
-                    if !rng.gen_bool(config.real_path_chance) {
+                    if !rng.random_bool(config.real_path_chance) {
                         continue;
                     }
 
@@ -194,13 +208,16 @@ fn build_listing(
     }
 }
 
-fn resolve_directory_path(config: &Config, segments: &[&str]) -> Option<DirectoryListing> {
+fn resolve_directory_path<R>(config: &Config, segments: &[&str]) -> Option<DirectoryListing>
+where
+    R: Rng + SeedableRng + Send,
+{
     let mut current_path = String::from("/");
     let mut source_path: Option<PathBuf> = None;
     let mut depth = 0;
 
     for segment in segments {
-        let listing = build_listing(config, &current_path, depth, source_path.clone());
+        let listing = build_listing::<R>(config, &current_path, depth, source_path.clone());
         let child = listing
             .children
             .iter()
@@ -210,16 +227,24 @@ fn resolve_directory_path(config: &Config, segments: &[&str]) -> Option<Director
         depth += 1;
     }
 
-    Some(build_listing(config, &current_path, depth, source_path))
+    Some(build_listing::<R>(
+        config,
+        &current_path,
+        depth,
+        source_path,
+    ))
 }
 
-fn generated_file_stream(
+fn generated_file_stream<R>(
     config: &Config,
     parent_path: &str,
     file_name: &str,
     depth: usize,
-) -> (BoxStream<'static, Result<Bytes, std::io::Error>>, u64) {
-    let mut rng = file_rng(config.seed, parent_path, depth, file_name);
+) -> (BoxStream<'static, Result<Bytes, std::io::Error>>, u64)
+where
+    R: Rng + SeedableRng + Send + 'static,
+{
+    let mut rng: R = file_rng::<R>(config.seed, parent_path, depth, file_name);
     let size_bytes = file_content_size(config, &mut rng, file_name);
     let stream = stream::unfold((rng, size_bytes), |(mut rng, remaining)| async move {
         if remaining == 0 {
@@ -233,7 +258,7 @@ fn generated_file_stream(
         };
         let mut bytes = vec![0u8; chunk_len];
         for byte in bytes.iter_mut() {
-            *byte = rng.gen_range(32u8..=126u8);
+            *byte = rng.random_range(32u8..=126u8);
         }
         Some((Ok(Bytes::from(bytes)), (rng, remaining - chunk_len as u64)))
     });
@@ -282,20 +307,29 @@ fn join_path(parent: &str, child: &str) -> String {
     }
 }
 
-fn directory_rng(seed: u64, path: &str, depth: usize) -> StdRng {
-    StdRng::seed_from_u64(stable_hash(seed, path, depth as u64))
+fn directory_rng<R>(seed: u64, path: &str, depth: usize) -> R
+where
+    R: SeedableRng,
+{
+    R::seed_from_u64(stable_hash(seed, path, depth as u64))
 }
 
-fn file_rng(seed: u64, path: &str, depth: usize, file_name: &str) -> StdRng {
+fn file_rng<R>(seed: u64, path: &str, depth: usize, file_name: &str) -> R
+where
+    R: SeedableRng,
+{
     let mut hash = stable_hash(seed, path, depth as u64);
     for byte in file_name.as_bytes() {
         hash ^= *byte as u64;
         hash = hash.wrapping_mul(0x1000_0000_01b3);
     }
-    StdRng::seed_from_u64(hash)
+    R::seed_from_u64(hash)
 }
 
-fn file_content_size(config: &Config, rng: &mut StdRng, file_name: &str) -> u64 {
+fn file_content_size<R>(config: &Config, rng: &mut R, file_name: &str) -> u64
+where
+    R: Rng + SeedableRng,
+{
     let extension = file_extension(file_name);
     let range = extension
         .and_then(|ext| lookup_extension_range(&config.dictionary.files.extensions, ext))
@@ -307,7 +341,7 @@ fn file_content_size(config: &Config, rng: &mut StdRng, file_name: &str) -> u64 
     if min_size >= max_size {
         min_size
     } else {
-        rng.gen_range(min_size..=max_size)
+        rng.random_range(min_size..=max_size)
     }
 }
 
@@ -343,7 +377,8 @@ fn lookup_extension_range<'a>(
 }
 
 fn generated_file_size(config: &Config, parent_path: &str, depth: usize, file_name: &str) -> u64 {
-    let mut rng = file_rng(config.seed, parent_path, depth, file_name);
+    let mut rng: Xoshiro256Plus =
+        file_rng::<Xoshiro256Plus>(config.seed, parent_path, depth, file_name);
     file_content_size(config, &mut rng, file_name)
 }
 
@@ -379,13 +414,17 @@ fn stable_hash(seed: u64, path: &str, depth: u64) -> u64 {
     hash
 }
 
-fn random_suffix(rng: &mut StdRng) -> String {
+fn random_suffix<R>(rng: &mut R) -> String
+where
+    R: Rng,
+{
     format!("{:08x}", rng.next_u32())
 }
 
-fn unique_name<F>(rng: &mut StdRng, used: &mut HashSet<String>, mut create: F) -> String
+fn unique_name<R, F>(rng: &mut R, used: &mut HashSet<String>, mut create: F) -> String
 where
-    F: FnMut(&mut StdRng) -> String,
+    R: Rng + SeedableRng,
+    F: FnMut(&mut R) -> String,
 {
     for _ in 0..10 {
         let candidate = create(rng);

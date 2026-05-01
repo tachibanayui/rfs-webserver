@@ -1,18 +1,27 @@
-use rand::rngs::StdRng;
-use rand::{Rng, RngCore};
+use rand::RngExt;
+use rand_xoshiro::Xoshiro256Plus;
+use rand_xoshiro::rand_core::Rng;
+use std::marker::PhantomData;
 
 use crate::dictionary::{Dictionary, IdFormat};
 
-pub struct NameGenerator<'a> {
+pub struct NameGenerator<'a, R = Xoshiro256Plus> {
     dictionary: &'a Dictionary,
+    _rng: PhantomData<R>,
 }
 
-impl<'a> NameGenerator<'a> {
+impl<'a, R> NameGenerator<'a, R>
+where
+    R: Rng,
+{
     pub fn new(dictionary: &'a Dictionary) -> Self {
-        Self { dictionary }
+        Self {
+            dictionary,
+            _rng: PhantomData,
+        }
     }
 
-    pub fn directory_name(&self, rng: &mut StdRng, depth: usize) -> String {
+    pub fn directory_name(&self, rng: &mut R, depth: usize) -> String {
         if depth == 0 {
             self.root_directory_name(rng)
         } else {
@@ -20,7 +29,7 @@ impl<'a> NameGenerator<'a> {
         }
     }
 
-    pub fn file_name(&self, rng: &mut StdRng) -> String {
+    pub fn file_name(&self, rng: &mut R) -> String {
         let stem = pick_from(rng, &self.dictionary.files.stems);
         let extensions: Vec<&String> = self.dictionary.files.extensions.keys().collect();
         let extension = pick_from(rng, &extensions);
@@ -34,11 +43,11 @@ impl<'a> NameGenerator<'a> {
         }
     }
 
-    fn root_directory_name(&self, rng: &mut StdRng) -> String {
+    fn root_directory_name(&self, rng: &mut R) -> String {
         let anchors_weight = self.dictionary.weights.anchors.unwrap_or(4);
         let common_weight = self.dictionary.weights.dirs_common.unwrap_or(1);
         let total = anchors_weight.saturating_add(common_weight).max(1);
-        let choice = rng.gen_range(0..total);
+        let choice = rng.random_range(0..total);
 
         if choice < anchors_weight {
             pick_from(rng, &self.dictionary.anchors.roots)
@@ -47,7 +56,7 @@ impl<'a> NameGenerator<'a> {
         }
     }
 
-    fn nested_directory_name(&self, rng: &mut StdRng) -> String {
+    fn nested_directory_name(&self, rng: &mut R) -> String {
         if self.dictionary.dirs.deep.is_empty() {
             return pick_from(rng, &self.dictionary.dirs.common);
         }
@@ -55,7 +64,7 @@ impl<'a> NameGenerator<'a> {
         let common_weight = self.dictionary.weights.dirs_common.unwrap_or(5);
         let deep_weight = self.dictionary.weights.dirs_deep.unwrap_or(2);
         let total = common_weight.saturating_add(deep_weight).max(1);
-        let choice = rng.gen_range(0..total);
+        let choice = rng.random_range(0..total);
 
         if choice < common_weight {
             pick_from(rng, &self.dictionary.dirs.common)
@@ -64,23 +73,23 @@ impl<'a> NameGenerator<'a> {
         }
     }
 
-    fn generate_id(&self, rng: &mut StdRng) -> String {
+    fn generate_id(&self, rng: &mut R) -> String {
         let format = pick_from(rng, &self.dictionary.ids.formats);
         match format {
             IdFormat::Uuid => uuid_like(rng),
-            IdFormat::Numeric => format!("{}", rng.gen_range(10_000..=999_999)),
+            IdFormat::Numeric => format!("{}", rng.random_range(10_000..=999_999)),
             IdFormat::Date => date_stamp(rng),
             IdFormat::InvoiceCode => invoice_code(rng),
         }
     }
 }
 
-fn pick_from<T: Clone>(rng: &mut StdRng, values: &[T]) -> T {
-    let index = rng.gen_range(0..values.len());
+fn pick_from<T: Clone, R: Rng>(rng: &mut R, values: &[T]) -> T {
+    let index = rng.random_range(0..values.len());
     values[index].clone()
 }
 
-fn uuid_like(rng: &mut StdRng) -> String {
+fn uuid_like<R: Rng>(rng: &mut R) -> String {
     let mut bytes = [0u8; 16];
     rng.fill_bytes(&mut bytes);
     format!(
@@ -104,15 +113,15 @@ fn uuid_like(rng: &mut StdRng) -> String {
     )
 }
 
-fn date_stamp(rng: &mut StdRng) -> String {
-    let year = rng.gen_range(2024..=2026);
-    let month = rng.gen_range(1..=12);
-    let day = rng.gen_range(1..=28);
+fn date_stamp<R: Rng>(rng: &mut R) -> String {
+    let year = rng.random_range(2024..=2026);
+    let month = rng.random_range(1..=12);
+    let day = rng.random_range(1..=28);
     format!("{year:04}-{month:02}-{day:02}")
 }
 
-fn invoice_code(rng: &mut StdRng) -> String {
-    let year = rng.gen_range(2024..=2026);
-    let number = rng.gen_range(1_00000..=999_999);
+fn invoice_code<R: Rng>(rng: &mut R) -> String {
+    let year = rng.random_range(2024..=2026);
+    let number = rng.random_range(100_000..=999_999);
     format!("INV-{year:04}-{number:06}")
 }
