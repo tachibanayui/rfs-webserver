@@ -50,7 +50,7 @@ pub struct Args {
     pub allow_symlink: bool,
 
     /// Probability in the range 0..1 for including a real entry
-    #[arg(long, default_value_t = 1.0)]
+    #[arg(long, default_value_t = 0.1)]
     pub real_path_chance: f64,
 
     /// Optional TOML dictionary to override the default naming lists
@@ -104,7 +104,7 @@ impl Args {
 
         let seed = self.seed.unwrap_or_else(current_seed);
         let real_path = match self.real_path {
-            Some(path) => Some(validate_real_path(path)?),
+            Some(path) => validate_real_path(path)?,
             None => None,
         };
         let dictionary = match self.dictionary {
@@ -138,15 +138,23 @@ fn current_seed() -> u64 {
         .unwrap_or_default()
 }
 
-fn validate_real_path(path: PathBuf) -> Result<PathBuf, String> {
-    let metadata = std::fs::metadata(&path)
-        .map_err(|error| format!("real-path does not exist or cannot be read: {error}"))?;
+fn validate_real_path(path: PathBuf) -> Result<Option<PathBuf>, String> {
+    let metadata = match std::fs::metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(error) => {
+            eprintln!(
+                "Warning: real-path does not exist or cannot be read: {error}. Proceeding without real-path."
+            );
+            return Ok(None);
+        }
+    };
 
     if !metadata.is_dir() {
         return Err("real-path must point to a directory".to_string());
     }
 
     std::fs::canonicalize(&path)
+        .map(Some)
         .map_err(|error| format!("real-path could not be resolved: {error}"))
 }
 

@@ -1,0 +1,16 @@
+services:
+  rfs-webserver:
+    image: shutano/rfs-webserver:0.1.0
+    build: .
+    ports:
+      - "3000:3000"
+    volumes:
+      - "./real-path:/real-path:ro"
+    command:
+      - "/app/rfs-webserver"
+      - "--seed"
+      - "12345"
+      - "--depth"
+      - "10"
+      - "--real-path"
+      - "/real-path"

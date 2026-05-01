@@ -41,7 +41,7 @@ By default the server listens on `0.0.0.0:3000`.
 --min-dirs <N>        Minimum subdirectories per directory, default: 0
 --max-dirs <N>        Maximum subdirectories per directory, default: 100
 --real-path <PATH>    Optional on-disk directory used as a source of real entries
---real-path-chance <P> Probability in the range 0..1 for including a real entry, default: 0
+--real-path-chance <P> Probability in the range 0..1 for including a real entry, default: 0.1
 --dictionary <PATH>   Optional TOML dictionary to override the default naming lists
 --footer-signature <TEXT> Footer signature text, default: rfs-webserver/<version>
 --delay-ms <MS>       Artificial delay in milliseconds applied per request
