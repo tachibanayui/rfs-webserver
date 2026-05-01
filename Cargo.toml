@@ -2,6 +2,12 @@
 name = "rfs-webserver"
 version = "0.1.0"
 edition = "2024"
+authors = ["tachibanayui", "shutano"]
+repository = "https://github.com/tachibanayui/rfs-webserver"
+homepage = "https://github.com/tachibanayui/rfs-webserver"
+description = "a small Rust webserver built with axum that serves a seeded randomly generated virtual filesystem."
+readme = "README.md"
+license = "MIT"
 
 [dependencies]
 axum = "0.8"

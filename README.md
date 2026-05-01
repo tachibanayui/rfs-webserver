@@ -1,6 +1,6 @@
 # rfs-webserver
 
-`rfs-webserver` is a small Rust webserver built with [axum](https://docs.rs/axum) that serves a randomly generated virtual filesystem.
+`rfs-webserver` is a small Rust webserver built with [axum](https://docs.rs/axum) that serves a seeded randomly generated virtual filesystem.
 
 The filesystem is generated on demand from a seed and the current request path. That means the server does not keep a full tree in memory, which keeps RAM usage low even for large virtual directory structures.
 
@@ -88,6 +88,8 @@ Use a custom dictionary (TOML) for naming:
 cargo run -- --dictionary .\dictionary.toml
 ```
 
+Docker compose example can be found at `docker-compose.yml`
+
 Example dictionary:
 
 ```toml
@@ -145,3 +147,7 @@ http://127.0.0.1:3000/
 ```
 
 Directory requests render an HTML listing page with links to child directories and files. File requests return plain text content.
+
+## License
+
+This project is licensed under the MIT License.

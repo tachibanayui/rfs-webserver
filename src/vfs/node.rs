@@ -164,8 +164,7 @@ fn build_listing(
             }
         }
 
-        // At root level, optionally include real entries as mounts
-        if path == "/" && config.real_path.is_some() {
+        if config.real_path.is_some() {
             let mut rng = directory_rng(config.seed, path, depth);
             if let Some(real_root) = config.real_path.as_ref() {
                 for real_child in real_children(real_root, config.allow_symlink) {
