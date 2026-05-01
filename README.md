@@ -1,5 +1,9 @@
 # rfs-webserver
 
+[![crates.io](https://img.shields.io/crates/v/rfs-webserver.svg)](https://crates.io/crates/rfs-webserver)
+[![docker image](https://img.shields.io/docker/v/shutano/rfs-webserver?label=docker)](https://hub.docker.com/r/shutano/rfs-webserver)
+[![github.com](https://img.shields.io/badge/github-repo-blue?logo=github)](https://github.com/tachibanayui/rfs-webserver)
+
 `rfs-webserver` is a small Rust webserver built with [axum](https://docs.rs/axum) that serves a seeded randomly generated virtual filesystem.
 
 The filesystem is generated on demand from a seed and the current request path. That means the server does not keep a full tree in memory, which keeps RAM usage low even for large virtual directory structures.
@@ -17,9 +21,31 @@ The filesystem is generated on demand from a seed and the current request path. 
 
 ## Requirements
 
-- Rust toolchain with Cargo
+- Rust toolchain with Cargo for compiling from source
+- Docker for pre-built image
 
 ## Run
+
+Choose one of the following ways to run the server.
+
+### 1. Run the pre-built Docker image
+
+The image is published on Docker Hub as [shutano/rfs-webserver](https://hub.docker.com/r/shutano/rfs-webserver).
+
+```bash
+docker run --rm -p 3000:3000 shutano/rfs-webserver:0.1.0
+```
+
+Docker compose example can be found at `docker-compose.yml`.
+
+### 2. Build and run with Cargo
+
+Clone this repository
+
+```bash
+git clone https://github.com/tachibanayui/rfs-webserver.git
+cd rfs-webserver
+```
 
 Start the server with the default configuration:
 
@@ -42,6 +68,7 @@ By default the server listens on `0.0.0.0:3000`.
 --max-dirs <N>        Maximum subdirectories per directory, default: 100
 --real-path <PATH>    Optional on-disk directory used as a source of real entries
 --real-path-chance <P> Probability in the range 0..1 for including a real entry, default: 0.1
+--allow-symlink       Allow symlinks to be served from real-path
 --dictionary <PATH>   Optional TOML dictionary to override the default naming lists
 --footer-signature <TEXT> Footer signature text, default: rfs-webserver/<version>
 --delay-ms <MS>       Artificial delay in milliseconds applied per request
@@ -87,8 +114,6 @@ Use a custom dictionary (TOML) for naming:
 ```bash
 cargo run -- --dictionary .\dictionary.toml
 ```
-
-Docker compose example can be found at `docker-compose.yml`
 
 Example dictionary:
 
