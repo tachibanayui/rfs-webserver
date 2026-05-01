@@ -39,7 +39,7 @@ async fn root(State(state): State<AppState>) -> Html<String> {
     Html(render_directory_page(
         "/",
         None,
-        &state.filesystem.root_listing().children,
+        &state.filesystem.root_listing().await.children,
         &state.footer_signature,
     ))
 }
@@ -51,7 +51,7 @@ async fn path_handler(State(state): State<AppState>, Path(path): Path<String>) -
         tokio::time::sleep(delay).await;
     }
 
-    if let Some(directory) = state.filesystem.directory_listing(&normalized) {
+    if let Some(directory) = state.filesystem.directory_listing(&normalized).await {
         Html(render_directory_page(
             &directory.path,
             parent_directory_path(&directory.path).as_deref(),

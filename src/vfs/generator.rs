@@ -11,8 +11,8 @@ mod tests {
     use super::*;
     use crate::dictionary::default_dictionary;
 
-    #[test]
-    fn generation_keeps_only_configuration_state() {
+    #[tokio::test]
+    async fn generation_keeps_only_configuration_state() {
         let filesystem = generate(&Config {
             host: std::net::Ipv4Addr::LOCALHOST,
             port: 3000,
@@ -30,11 +30,11 @@ mod tests {
             delay: None,
         });
 
-        assert!(filesystem.root_listing().children.len() >= 2);
+        assert!(filesystem.root_listing().await.children.len() >= 2);
     }
 
-    #[test]
-    fn generation_is_deterministic_for_same_seed() {
+    #[tokio::test]
+    async fn generation_is_deterministic_for_same_seed() {
         let config = Config {
             host: std::net::Ipv4Addr::LOCALHOST,
             port: 3000,
@@ -56,8 +56,8 @@ mod tests {
         let second = generate(&config);
 
         assert_eq!(
-            first.root_listing().children,
-            second.root_listing().children
+            first.root_listing().await.children,
+            second.root_listing().await.children
         );
     }
 }

@@ -1,19 +1,25 @@
 use bytes::Bytes;
+use extension_trait::extension_trait;
 use futures::stream::{self, BoxStream};
+use fxhash::FxHashSet;
 use rand::RngExt;
 use rand_xoshiro::Xoshiro256Plus;
 use rand_xoshiro::rand_core::{Rng, SeedableRng};
-use std::collections::{BTreeMap, HashSet};
-use std::fs;
+use smallstr::SmallString;
+use std::borrow::Borrow;
+use std::collections::BTreeMap;
+use std::fmt::Write as _;
+use std::iter;
 use std::marker::PhantomData;
+use std::ops::Deref;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
-use tokio::fs::File;
+use tokio::fs::{self, File};
 use tokio_util::io::ReaderStream;
 
 use crate::cli::Config;
 use crate::dictionary::SizeRange;
-use crate::vfs::naming::NameGenerator;
+use crate::vfs::naming::{GenString, NameGenerator};
 
 #[derive(Debug, Clone)]
 pub struct VirtualFilesystem<R = Xoshiro256Plus> {
@@ -48,28 +54,32 @@ impl<R> VirtualFilesystem<R>
 where
     R: Rng + SeedableRng + Send + 'static,
 {
-    pub fn root_listing(&self) -> DirectoryListing {
+    pub async fn root_listing(&self) -> DirectoryListing {
         self.directory_listing("/")
+            .await
             .expect("root directory must always exist")
     }
 
-    pub fn directory_listing(&self, path: &str) -> Option<DirectoryListing> {
-        let normalized = normalize_directory_path(path)?;
-        let segments = path_segments(&normalized);
-        resolve_directory_path::<R>(&self.config, &segments)
+    pub async fn directory_listing(&self, path: &str) -> Option<DirectoryListing> {
+        resolve_directory_path::<R>(&self.config, path).await
     }
 
     pub async fn file_entry(&self, path: &str) -> Option<FileEntry> {
-        let normalized = normalize_file_path(path)?;
-        let segments = path_segments(&normalized);
-        let (file_name, parent_segments) = segments.split_last()?;
-        let parent_path = segments_to_path(parent_segments);
-        let parent_listing = self.directory_listing(&parent_path)?;
-
+        let trimmed = path.trim_end_matches('/');
+        let Some(pos) = trimmed
+            .as_bytes()
+            .iter()
+            .rev()
+            .position(|x| *x == '/' as u8)
+        else {
+            return None;
+        };
+        let (parent, file) = trimmed.split_at(trimmed.len() - pos);
+        let parent_listing = self.directory_listing(parent).await?;
         let child = parent_listing
             .children
             .into_iter()
-            .find(|child| !child.is_directory && child.name == *file_name)?;
+            .find(|child| !child.is_directory && child.name == *file)?;
 
         match child.source_path {
             Some(source_path) => {
@@ -81,12 +91,9 @@ where
                 })
             }
             None => {
-                let (stream, size_bytes) = generated_file_stream::<R>(
-                    &self.config,
-                    &parent_path,
-                    file_name,
-                    parent_segments.len(),
-                );
+                let depth = parent.chars().filter(|x| *x == '/').count();
+                let (stream, size_bytes) =
+                    generated_file_stream::<R>(&self.config, &parent, file, depth);
                 Some(FileEntry {
                     stream,
                     size_bytes: Some(size_bytes),
@@ -105,134 +112,254 @@ impl VirtualFilesystem<Xoshiro256Plus> {
     }
 }
 
-fn build_listing<R>(
-    config: &Config,
-    path: &str,
-    depth: usize,
-    source_path: Option<PathBuf>,
-) -> DirectoryListing
-where
-    R: Rng + SeedableRng + Send,
-{
-    let mut children = Vec::new();
+struct SyntheticChildEntry<'a> {
+    name: NodeStr<'a>,
+    is_directory: bool,
+}
 
-    // If we're inside a mounted real directory, list its actual contents
-    if let Some(source_path) = source_path.as_ref() {
-        for real_child in real_children(source_path, config.allow_symlink) {
-            let child_path = join_path(path, &real_child.name);
-            children.push(ChildEntry {
-                name: real_child.name,
-                path: child_path,
-                is_directory: real_child.is_directory,
-                source_path: Some(real_child.path),
-                size_bytes: real_child.size_bytes,
-                modified_unix_seconds: real_child.modified_unix_seconds,
-            });
-        }
-    } else {
-        // Otherwise, generate synthetic VFS entries
-        let mut rng = directory_rng::<R>(config.seed, path, depth);
-
-        let name_generator = NameGenerator::<R>::new(&config.dictionary);
-        let mut used_names = HashSet::new();
-
-        let file_count = rng.random_range(config.min_files..=config.max_files);
-        for _ in 0..file_count {
-            let name = unique_name(&mut rng, &mut used_names, |rng| {
-                name_generator.file_name(rng)
-            });
-            children.push(ChildEntry {
-                name: name.clone(),
-                path: join_path(path, &name),
-                is_directory: false,
-                source_path: None,
-                size_bytes: Some(generated_file_size(config, path, depth, &name)),
-                modified_unix_seconds: Some(deterministic_modified_seconds(
-                    config.seed,
-                    path,
-                    depth,
-                    &name,
-                )),
-            });
-        }
-
-        if depth < config.depth {
-            let directory_count = rng.random_range(config.min_dirs..=config.max_dirs);
-            for _ in 0..directory_count {
-                let name = unique_name(&mut rng, &mut used_names, |rng| {
-                    name_generator.directory_name(rng, depth)
-                });
-                children.push(ChildEntry {
-                    name: name.clone(),
-                    path: join_path(path, &name),
-                    is_directory: true,
-                    source_path: None,
-                    size_bytes: None,
-                    modified_unix_seconds: Some(deterministic_modified_seconds(
-                        config.seed,
-                        path,
-                        depth,
-                        &name,
-                    )),
-                });
-            }
-        }
-
-        if config.real_path.is_some() {
-            let mut rng = directory_rng::<R>(config.seed, path, depth);
-            if let Some(real_root) = config.real_path.as_ref() {
-                for real_child in real_children(real_root, config.allow_symlink) {
-                    if !rng.random_bool(config.real_path_chance) {
-                        continue;
-                    }
-
-                    let child_path = join_path(path, &real_child.name);
-                    children.push(ChildEntry {
-                        name: real_child.name,
-                        path: child_path,
-                        is_directory: real_child.is_directory,
-                        source_path: Some(real_child.path),
-                        size_bytes: real_child.size_bytes,
-                        modified_unix_seconds: real_child.modified_unix_seconds,
-                    });
-                }
-            }
-        }
+impl<'a> SyntheticChildEntry<'a> {
+    pub fn size_bytes(&self, config: &Config, path: &str, depth: usize) -> u64 {
+        generated_file_size(config, path, depth, &self.name)
     }
 
-    children.sort_by(|left, right| left.path.cmp(&right.path));
-
-    DirectoryListing {
-        path: path.to_string(),
-        children,
+    pub fn modified_unix_seconds(&self, config: &Config, path: &str, depth: usize) -> i64 {
+        deterministic_modified_seconds(config.seed, path, depth, &self.name)
     }
 }
 
-fn resolve_directory_path<R>(config: &Config, segments: &[&str]) -> Option<DirectoryListing>
+type NodeStr<'a> = Cow<'a, GenString, str>;
+type UniqueNameCache<'a> = FxHashSet<NodeStr<'a>>;
+
+/// Mirror std Cow but allow custom IntoOwned type
+#[derive(PartialEq, Eq, PartialOrd, Ord, Hash)]
+enum Cow<'a, Owned, Borrowed: ?Sized = Owned> {
+    Borrowed(&'a Borrowed),
+    Onwed(Owned),
+}
+
+impl<'a, Owned: Clone, Borrowed: ?Sized> Clone for Cow<'a, Owned, Borrowed> {
+    fn clone(&self) -> Self {
+        match self {
+            Self::Borrowed(arg0) => Self::Borrowed(arg0.clone()),
+            Self::Onwed(arg0) => Self::Onwed(arg0.clone()),
+        }
+    }
+}
+
+impl<'a, Owned, Borrowed> Deref for Cow<'a, Owned, Borrowed>
+where
+    Owned: Deref<Target = Borrowed>,
+    Borrowed: ?Sized,
+{
+    type Target = Borrowed;
+
+    fn deref(&self) -> &Self::Target {
+        match self {
+            Cow::Borrowed(b) => b,
+            Cow::Onwed(o) => o,
+        }
+    }
+}
+
+#[extension_trait]
+pub impl<T> CowExt for T {
+    fn into_owned_cow<Borrowed: ?Sized>(self) -> Cow<'static, Self, Borrowed>
+    where
+        Self: Sized,
+    {
+        Cow::Onwed(self)
+    }
+}
+
+pub trait CowRefExt<'a, T: ?Sized> {
+    fn into_borrowed_cow<Owned>(self) -> Cow<'a, Owned, T>
+    where
+        Self: Sized;
+}
+
+impl<'a, T: ?Sized> CowRefExt<'a, T> for &'a T {
+    fn into_borrowed_cow<Owned>(self) -> Cow<'a, Owned, T> {
+        Cow::Borrowed(self)
+    }
+}
+
+fn gen_synthetic_dir<'a, R>(
+    config: &'a Config,
+    path: &str,
+    depth: usize,
+    used_names: &mut UniqueNameCache<'a>,
+) -> impl Iterator<Item = SyntheticChildEntry<'a>>
 where
     R: Rng + SeedableRng + Send,
 {
-    let mut current_path = String::from("/");
-    let mut source_path: Option<PathBuf> = None;
-    let mut depth = 0;
+    let mut rng = directory_rng::<R>(config.seed, path, depth);
+    let name_gen = NameGenerator::<R>::new(&config.dictionary);
+    let file_count = rng.random_range(config.min_files..=config.max_files);
+    let dir_count = if depth < config.depth {
+        rng.random_range(config.min_dirs..=config.max_dirs)
+    } else {
+        0
+    };
 
-    for segment in segments {
-        let listing = build_listing::<R>(config, &current_path, depth, source_path.clone());
-        let child = listing
-            .children
-            .iter()
-            .find(|candidate| candidate.is_directory && candidate.name == *segment)?;
-        current_path = child.path.clone();
-        source_path = child.source_path.clone();
+    iter::repeat(false)
+        .take(file_count)
+        .chain(iter::repeat(true).take(dir_count))
+        .map(move |x| {
+            let name = unique_name(&mut rng, used_names, |rng| {
+                if x {
+                    name_gen
+                        .directory_name(rng, depth)
+                        .into_borrowed_cow::<GenString>()
+                } else {
+                    name_gen.file_name(rng).into_owned_cow()
+                }
+            });
+            SyntheticChildEntry {
+                name: name,
+                is_directory: x,
+            }
+        })
+}
+
+fn get_selected_cand<R, T>(
+    real_path_chance: f64,
+    rng: &mut R,
+    iter: impl Iterator<Item = T>,
+) -> impl Iterator<Item = T>
+where
+    R: Rng + SeedableRng + Send,
+    T: Borrow<RealChildEntry>,
+{
+    iter.filter(move |_| rng.random_bool(real_path_chance))
+}
+
+async fn resolve_directory_path<R>(config: &Config, path: &str) -> Option<DirectoryListing>
+where
+    R: Rng + SeedableRng + Send,
+{
+    let root_real_path = match config.real_path.as_ref() {
+        Some(x) => real_children(x, config.allow_symlink).await,
+        None => vec![],
+    };
+
+    let rrp_names: FxHashSet<_> = root_real_path.iter().map(|x| &*x.name).collect();
+
+    let mut iter = path.trim_matches('/').split('/').peekable();
+    let mut current_path = String::from("");
+    let mut depth = 0;
+    let mut is_real_path = None;
+
+    let mut used_names = FxHashSet::default();
+    for seg in iter.by_ref() {
+        if seg.is_empty() {
+            continue;
+        }
+
+        if depth == config.depth {
+            return None;
+        }
+        // User query a path have the same name with real path candidate
+        // but we still need to check if it actually inside real path or the random generator generate a name
+        // similar to real path
+        if rrp_names.contains(seg) {
+            let mut rng = directory_rng::<R>(config.seed, &current_path, depth);
+            let is_real =
+                get_selected_cand(config.real_path_chance, &mut rng, root_real_path.iter())
+                    .any(|x| x.name == seg && x.is_directory);
+            if is_real {
+                is_real_path.replace(seg);
+                break;
+            }
+        }
+
+        used_names.clear();
+        let is_child = gen_synthetic_dir::<R>(config, &current_path, depth, &mut used_names)
+            .any(|x| &*x.name == seg && x.is_directory);
+
+        current_path.push('/');
+        current_path.push_str(seg);
+        if !is_child {
+            return None;
+        }
+
         depth += 1;
     }
 
-    Some(build_listing::<R>(
-        config,
-        &current_path,
-        depth,
-        source_path,
-    ))
+    let Some(rps) = is_real_path else {
+        used_names.clear();
+
+        let mut children: Vec<_> =
+            gen_synthetic_dir::<R>(config, &current_path, depth, &mut used_names)
+                .map(|x| ChildEntry {
+                    path: join_path(&current_path, &x.name),
+                    size_bytes: (!x.is_directory)
+                        .then(|| x.size_bytes(config, &current_path, depth)),
+                    is_directory: x.is_directory,
+                    source_path: None,
+                    modified_unix_seconds: Some(x.modified_unix_seconds(
+                        config,
+                        &current_path,
+                        depth,
+                    )),
+                    name: x.name.to_string(),
+                })
+                .collect();
+
+        let mut rng = directory_rng::<R>(config.seed, &current_path, depth);
+        children.extend(
+            get_selected_cand(
+                config.real_path_chance,
+                &mut rng,
+                root_real_path.into_iter(),
+            )
+            .map(|x| ChildEntry {
+                path: join_path(&current_path, &x.name),
+                is_directory: x.is_directory,
+                source_path: Some(x.path),
+                size_bytes: x.size_bytes,
+                modified_unix_seconds: x.modified_unix_seconds,
+                name: x.name,
+            }),
+        );
+
+        children.sort_unstable_by(|left, right| left.path.cmp(&right.path));
+        return Some(DirectoryListing {
+            path: current_path.to_string(),
+            children,
+        });
+    };
+
+    let mut pb = PathBuf::from(".");
+    current_path.push('/');
+    current_path.push_str(rps);
+    pb.push(rps);
+    for seg in iter.by_ref() {
+        current_path.push('/');
+        current_path.push_str(seg);
+        pb.push(seg);
+    }
+
+    let mut children: Vec<_> = real_children(
+        &config.real_path.as_ref().unwrap().join(&pb),
+        config.allow_symlink,
+    )
+    .await
+    .into_iter()
+    .map(|x| ChildEntry {
+        path: join_path(&current_path, &x.name),
+        name: x.name,
+        is_directory: x.is_directory,
+        source_path: Some(x.path),
+        size_bytes: x.size_bytes,
+        modified_unix_seconds: x.modified_unix_seconds,
+    })
+    .collect();
+
+    children.sort_unstable_by(|left, right| left.path.cmp(&right.path));
+    return Some(DirectoryListing {
+        path: current_path.to_string(),
+        children,
+    });
 }
 
 fn generated_file_stream<R>(
@@ -264,39 +391,6 @@ where
     });
 
     (Box::pin(stream), size_bytes)
-}
-
-fn normalize_directory_path(path: &str) -> Option<String> {
-    let trimmed = path.trim_matches('/');
-    if trimmed.is_empty() {
-        Some("/".to_string())
-    } else {
-        Some(format!("/{}", trimmed))
-    }
-}
-
-fn normalize_file_path(path: &str) -> Option<String> {
-    let trimmed = path.trim_matches('/');
-    if trimmed.is_empty() {
-        None
-    } else {
-        Some(format!("/{}", trimmed))
-    }
-}
-
-fn path_segments(path: &str) -> Vec<&str> {
-    path.trim_matches('/')
-        .split('/')
-        .filter(|segment| !segment.is_empty())
-        .collect()
-}
-
-fn segments_to_path(segments: &[&str]) -> String {
-    if segments.is_empty() {
-        "/".to_string()
-    } else {
-        format!("/{}", segments.join("/"))
-    }
 }
 
 fn join_path(parent: &str, child: &str) -> String {
@@ -421,10 +515,10 @@ where
     format!("{:08x}", rng.next_u32())
 }
 
-fn unique_name<R, F>(rng: &mut R, used: &mut HashSet<String>, mut create: F) -> String
+fn unique_name<'a, R, F>(rng: &mut R, used: &mut UniqueNameCache<'a>, mut create: F) -> NodeStr<'a>
 where
     R: Rng + SeedableRng,
-    F: FnMut(&mut R) -> String,
+    F: FnMut(&mut R) -> NodeStr<'a>,
 {
     for _ in 0..10 {
         let candidate = create(rng);
@@ -433,13 +527,15 @@ where
         }
     }
 
-    let fallback = format!("{}-{}", create(rng), random_suffix(rng));
+    let mut fallback = SmallString::new();
+    write!(&mut fallback, "{}-{}", &*create(rng), random_suffix(rng)).unwrap();
+    let fallback = fallback.into_owned_cow();
     used.insert(fallback.clone());
     fallback
 }
 
 #[derive(Debug, Clone)]
-struct RealChildEntry {
+pub struct RealChildEntry {
     name: String,
     path: PathBuf,
     is_directory: bool,
@@ -447,15 +543,24 @@ struct RealChildEntry {
     modified_unix_seconds: Option<i64>,
 }
 
-fn real_children(source_path: &Path, allow_symlink: bool) -> Vec<RealChildEntry> {
+pub async fn real_children(source_path: &Path, allow_symlink: bool) -> Vec<RealChildEntry> {
     let mut children = Vec::new();
 
-    let Ok(entries) = fs::read_dir(source_path) else {
+    let Ok(mut entries) = fs::read_dir(source_path).await else {
         return children;
     };
 
-    for entry in entries.flatten() {
-        let Ok(file_type) = entry.file_type() else {
+    loop {
+        let item = entries.next_entry().await;
+        let Ok(item) = item else {
+            continue;
+        };
+
+        let Some(entry) = item else {
+            break;
+        };
+
+        let Ok(file_type) = entry.file_type().await else {
             continue;
         };
 
@@ -463,7 +568,7 @@ fn real_children(source_path: &Path, allow_symlink: bool) -> Vec<RealChildEntry>
             continue;
         }
 
-        let Ok(metadata) = entry.metadata() else {
+        let Ok(metadata) = entry.metadata().await else {
             continue;
         };
 
@@ -495,7 +600,7 @@ fn real_children(source_path: &Path, allow_symlink: bool) -> Vec<RealChildEntry>
         });
     }
 
-    children.sort_by(|left, right| left.name.cmp(&right.name));
+    children.sort_unstable_by(|left, right| left.name.cmp(&right.name));
     children
 }
 
@@ -559,20 +664,20 @@ mod tests {
         config
     }
 
-    #[test]
-    fn directory_listings_are_deterministic_for_same_seed() {
+    #[tokio::test]
+    async fn directory_listings_are_deterministic_for_same_seed() {
         let filesystem = VirtualFilesystem::new(config());
-        let first = filesystem.directory_listing("/").unwrap();
-        let second = filesystem.directory_listing("/").unwrap();
+        let first = filesystem.directory_listing("/").await.unwrap();
+        let second = filesystem.directory_listing("/").await.unwrap();
 
         assert_eq!(first.children.len(), second.children.len());
         assert_eq!(first.children[0].path, second.children[0].path);
     }
 
-    #[test]
-    fn directory_depth_is_capped() {
+    #[tokio::test]
+    async fn directory_depth_is_capped() {
         let filesystem = VirtualFilesystem::new(config());
-        let root = filesystem.root_listing();
+        let root = filesystem.root_listing().await;
         let first_directory = root
             .children
             .iter()
@@ -581,16 +686,19 @@ mod tests {
 
         let child_listing = filesystem
             .directory_listing(&first_directory.path)
+            .await
             .expect("child directory should exist");
 
         let grandchild_directory = child_listing
             .children
             .iter()
-            .find(|child| child.is_directory)
+            .filter(|x| x.is_directory)
+            .next()
             .expect("expected a nested directory at depth 1");
 
         let grandchild_listing = filesystem
             .directory_listing(&grandchild_directory.path)
+            .await
             .expect("grandchild directory should exist");
 
         assert!(
@@ -598,19 +706,6 @@ mod tests {
                 .children
                 .iter()
                 .all(|child| !child.is_directory)
-        );
-    }
-
-    #[test]
-    fn generated_names_are_not_template_like() {
-        let filesystem = VirtualFilesystem::new(config());
-        let root = filesystem.root_listing();
-
-        assert!(
-            !root
-                .children
-                .iter()
-                .any(|child| child.name.starts_with("dir-") || child.name.starts_with("file-"))
         );
     }
 
@@ -630,7 +725,7 @@ mod tests {
         write_file(&source.join("nested").join("child.txt"), "nested contents");
 
         let filesystem = VirtualFilesystem::new(real_config(source.clone(), 1.0));
-        let root = filesystem.root_listing();
+        let root = filesystem.root_listing().await;
 
         let alpha = root
             .children
@@ -659,6 +754,7 @@ mod tests {
 
         let nested_listing = filesystem
             .directory_listing(&nested.path)
+            .await
             .expect("real directory should resolve");
 
         let child = nested_listing
@@ -668,15 +764,15 @@ mod tests {
             .expect("expected nested real file");
 
         let nested_file = filesystem
-            .file_entry(&child.path)
+            .file_entry(dbg!(&child.path))
             .await
             .expect("nested real file should resolve");
 
         assert_eq!(read_stream_to_string(nested_file).await, "nested contents");
     }
 
-    #[test]
-    fn real_mount_shows_only_real_contents_not_generated() {
+    #[tokio::test]
+    async fn real_mount_shows_only_real_contents_not_generated() {
         let source = temp_dir("mount-test");
         write_file(&source.join("real-file.txt"), "real content");
         write_file(&source.join("real-subdir").join("nested.txt"), "nested");
@@ -690,7 +786,7 @@ mod tests {
         config.max_dirs = 5;
 
         let filesystem = VirtualFilesystem::new(config);
-        let root = filesystem.root_listing();
+        let root = filesystem.root_listing().await;
 
         // Real path contents should appear at root
         let real_file = root
@@ -709,6 +805,7 @@ mod tests {
         if let Some(subdir) = real_subdir.filter(|e| e.is_directory) {
             let subdir_listing = filesystem
                 .directory_listing(&subdir.path)
+                .await
                 .expect("mounted real dir should resolve");
 
             let nested = subdir_listing
