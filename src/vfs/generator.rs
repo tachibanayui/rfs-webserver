@@ -1,9 +1,9 @@
-use crate::cli::Config;
+use crate::{cli::Config, vfs::node::FsCache};
 
 use super::node::VirtualFilesystem;
 
 pub fn generate(config: &Config) -> VirtualFilesystem {
-    VirtualFilesystem::new(config.clone())
+    VirtualFilesystem::new(config.clone(), FsCache::new(config))
 }
 
 #[cfg(test)]
@@ -25,6 +25,7 @@ mod tests {
             real_path: None,
             real_path_chance: 0.0,
             allow_symlink: false,
+            fs_cache_ttl: std::time::Duration::from_millis(3000),
             dictionary: default_dictionary(),
             footer_signature: "rfs-webserver/test".to_string(),
             delay: None,
@@ -47,6 +48,7 @@ mod tests {
             real_path: None,
             real_path_chance: 0.0,
             allow_symlink: false,
+            fs_cache_ttl: std::time::Duration::from_millis(3000),
             dictionary: default_dictionary(),
             footer_signature: "rfs-webserver/test".to_string(),
             delay: None,

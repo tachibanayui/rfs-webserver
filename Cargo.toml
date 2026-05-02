@@ -30,6 +30,7 @@ fxhash = "0.2.1"
 vecmap-rs = "0.2.4"
 smallstr = { version = "0.3.1", features = ["union", "serde"] }
 extension-trait = "1.0.2"
+quick_cache = "0.6.21"
 
 [dev-dependencies]
 pretty_assertions = "1.4"

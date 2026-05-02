@@ -1,19 +1,23 @@
 use bytes::Bytes;
 use extension_trait::extension_trait;
 use futures::stream::{self, BoxStream};
-use fxhash::FxHashSet;
+use fxhash::{FxBuildHasher, FxHashMap, FxHashSet};
+use quick_cache::sync::Cache;
+use quick_cache::{OptionsBuilder, UnitWeighter};
 use rand::RngExt;
 use rand_xoshiro::Xoshiro256Plus;
 use rand_xoshiro::rand_core::{Rng, SeedableRng};
 use smallstr::SmallString;
 use std::borrow::Borrow;
 use std::collections::BTreeMap;
+use std::convert::Infallible;
 use std::fmt::Write as _;
 use std::iter;
 use std::marker::PhantomData;
 use std::ops::Deref;
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::Arc;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use tokio::fs::{self, File};
 use tokio_util::io::ReaderStream;
 
@@ -22,7 +26,111 @@ use crate::dictionary::SizeRange;
 use crate::vfs::naming::{GenString, NameGenerator};
 
 #[derive(Debug, Clone)]
+struct RealPathCache {
+    data: FxHashMap<String, RealChildEntry>,
+    ttl: Instant,
+}
+
+#[derive(Debug, Clone)]
+struct FullPathCache {
+    data: Option<Arc<DirectoryListing>>,
+    ttl: Instant,
+}
+
+#[derive(Debug)]
+struct FsCacheInner {
+    allow_symlink: bool,
+    config: Config,
+    real_paths: Cache<PathBuf, Arc<RealPathCache>, UnitWeighter, FxBuildHasher>,
+    full_paths: Cache<String, Arc<FullPathCache>, UnitWeighter, FxBuildHasher>,
+}
+
+#[derive(Debug, Clone)]
+pub struct FsCache {
+    inner: Arc<FsCacheInner>,
+}
+
+impl FsCache {
+    async fn read_dir(&self, path: &Path) -> Arc<RealPathCache> {
+        self.inner
+            .real_paths
+            .remove_if(path, |x| x.ttl > Instant::now());
+        let item = self
+            .inner
+            .real_paths
+            .get_or_insert_async(path, async {
+                let items = real_children(path, self.inner.allow_symlink)
+                    .await
+                    .into_iter()
+                    .map(|x| (x.name.clone(), x))
+                    .collect();
+                Ok::<_, Infallible>(
+                    RealPathCache {
+                        data: items,
+                        ttl: Instant::now() + self.inner.config.fs_cache_ttl,
+                    }
+                    .into(),
+                )
+            })
+            .await
+            .unwrap();
+        return item;
+    }
+
+    async fn read_vfs_dir<R>(&self, path: &str) -> Arc<FullPathCache>
+    where
+        R: Rng + SeedableRng + Send + 'static,
+    {
+        self.inner
+            .full_paths
+            .remove_if(path, |x| x.ttl > Instant::now());
+        let item = self
+            .inner
+            .full_paths
+            .get_or_insert_async(path, async {
+                let listing = resolve_directory_path::<R>(&self, &self.inner.config, path).await;
+                Ok::<_, Infallible>(Arc::new(FullPathCache {
+                    data: listing.map(|x| x.into()),
+                    ttl: Instant::now() + self.inner.config.fs_cache_ttl,
+                }))
+            })
+            .await
+            .unwrap();
+        return item;
+    }
+
+    pub fn new(config: &Config) -> Self {
+        let cache_opts = OptionsBuilder::new()
+            .estimated_items_capacity(1000)
+            .weight_capacity(1000)
+            .build()
+            .unwrap();
+        let inner = FsCacheInner {
+            allow_symlink: config.allow_symlink,
+            config: config.clone(),
+            real_paths: Cache::with_options(
+                cache_opts.clone(),
+                Default::default(),
+                FxBuildHasher::new(),
+                Default::default(),
+            ),
+            full_paths: Cache::with_options(
+                cache_opts,
+                Default::default(),
+                FxBuildHasher::new(),
+                Default::default(),
+            ),
+        };
+
+        Self {
+            inner: inner.into(),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
 pub struct VirtualFilesystem<R = Xoshiro256Plus> {
+    cache: FsCache,
     config: Config,
     _rng: PhantomData<R>,
 }
@@ -54,14 +162,14 @@ impl<R> VirtualFilesystem<R>
 where
     R: Rng + SeedableRng + Send + 'static,
 {
-    pub async fn root_listing(&self) -> DirectoryListing {
+    pub async fn root_listing(&self) -> Arc<DirectoryListing> {
         self.directory_listing("/")
             .await
             .expect("root directory must always exist")
     }
 
-    pub async fn directory_listing(&self, path: &str) -> Option<DirectoryListing> {
-        resolve_directory_path::<R>(&self.config, path).await
+    pub async fn directory_listing(&self, path: &str) -> Option<Arc<DirectoryListing>> {
+        self.cache.read_vfs_dir::<R>(path).await.data.clone()
     }
 
     pub async fn file_entry(&self, path: &str) -> Option<FileEntry> {
@@ -78,10 +186,10 @@ where
         let parent_listing = self.directory_listing(parent).await?;
         let child = parent_listing
             .children
-            .into_iter()
+            .iter()
             .find(|child| !child.is_directory && child.name == *file)?;
 
-        match child.source_path {
+        match &child.source_path {
             Some(source_path) => {
                 let file = File::open(&source_path).await.ok()?;
                 let stream = Box::pin(ReaderStream::new(file));
@@ -104,9 +212,10 @@ where
 }
 
 impl VirtualFilesystem<Xoshiro256Plus> {
-    pub fn new(config: Config) -> Self {
+    pub fn new(config: Config, cache: FsCache) -> Self {
         Self {
             config,
+            cache,
             _rng: PhantomData,
         }
     }
@@ -132,7 +241,7 @@ type UniqueNameCache<'a> = FxHashSet<NodeStr<'a>>;
 
 /// Mirror std Cow but allow custom IntoOwned type
 #[derive(PartialEq, Eq, PartialOrd, Ord, Hash)]
-enum Cow<'a, Owned, Borrowed: ?Sized = Owned> {
+pub enum Cow<'a, Owned, Borrowed: ?Sized = Owned> {
     Borrowed(&'a Borrowed),
     Onwed(Owned),
 }
@@ -140,7 +249,7 @@ enum Cow<'a, Owned, Borrowed: ?Sized = Owned> {
 impl<'a, Owned: Clone, Borrowed: ?Sized> Clone for Cow<'a, Owned, Borrowed> {
     fn clone(&self) -> Self {
         match self {
-            Self::Borrowed(arg0) => Self::Borrowed(arg0.clone()),
+            Self::Borrowed(arg0) => Self::Borrowed(arg0),
             Self::Onwed(arg0) => Self::Onwed(arg0.clone()),
         }
     }
@@ -233,16 +342,21 @@ where
     iter.filter(move |_| rng.random_bool(real_path_chance))
 }
 
-async fn resolve_directory_path<R>(config: &Config, path: &str) -> Option<DirectoryListing>
+async fn resolve_directory_path<R>(
+    fsc: &FsCache,
+    config: &Config,
+    path: &str,
+) -> Option<DirectoryListing>
 where
     R: Rng + SeedableRng + Send,
 {
-    let root_real_path = match config.real_path.as_ref() {
-        Some(x) => real_children(x, config.allow_symlink).await,
-        None => vec![],
+    let root_dir = match config.real_path.as_ref() {
+        Some(x) => Some(fsc.read_dir(x).await),
+        None => None,
     };
 
-    let rrp_names: FxHashSet<_> = root_real_path.iter().map(|x| &*x.name).collect();
+    let or = Default::default();
+    let root_real_path = root_dir.as_ref().map(|x| &x.data).unwrap_or(&or);
 
     let mut iter = path.trim_matches('/').split('/').peekable();
     let mut current_path = String::from("");
@@ -261,10 +375,10 @@ where
         // User query a path have the same name with real path candidate
         // but we still need to check if it actually inside real path or the random generator generate a name
         // similar to real path
-        if rrp_names.contains(seg) {
+        if root_real_path.contains_key(seg) {
             let mut rng = directory_rng::<R>(config.seed, &current_path, depth);
             let is_real =
-                get_selected_cand(config.real_path_chance, &mut rng, root_real_path.iter())
+                get_selected_cand(config.real_path_chance, &mut rng, root_real_path.values())
                     .any(|x| x.name == seg && x.is_directory);
             if is_real {
                 is_real_path.replace(seg);
@@ -307,19 +421,16 @@ where
 
         let mut rng = directory_rng::<R>(config.seed, &current_path, depth);
         children.extend(
-            get_selected_cand(
-                config.real_path_chance,
-                &mut rng,
-                root_real_path.into_iter(),
-            )
-            .map(|x| ChildEntry {
-                path: join_path(&current_path, &x.name),
-                is_directory: x.is_directory,
-                source_path: Some(x.path),
-                size_bytes: x.size_bytes,
-                modified_unix_seconds: x.modified_unix_seconds,
-                name: x.name,
-            }),
+            get_selected_cand(config.real_path_chance, &mut rng, root_real_path.values()).map(
+                |x| ChildEntry {
+                    path: join_path(&current_path, &x.name),
+                    is_directory: x.is_directory,
+                    source_path: Some(x.path.clone()),
+                    size_bytes: x.size_bytes,
+                    modified_unix_seconds: x.modified_unix_seconds,
+                    name: x.name.clone(),
+                },
+            ),
         );
 
         children.sort_unstable_by(|left, right| left.path.cmp(&right.path));
@@ -339,21 +450,21 @@ where
         pb.push(seg);
     }
 
-    let mut children: Vec<_> = real_children(
-        &config.real_path.as_ref().unwrap().join(&pb),
-        config.allow_symlink,
-    )
-    .await
-    .into_iter()
-    .map(|x| ChildEntry {
-        path: join_path(&current_path, &x.name),
-        name: x.name,
-        is_directory: x.is_directory,
-        source_path: Some(x.path),
-        size_bytes: x.size_bytes,
-        modified_unix_seconds: x.modified_unix_seconds,
-    })
-    .collect();
+    let mut children: Vec<_> = fsc
+        .read_dir(&config.real_path.as_ref().unwrap().join(&pb))
+        .await
+        .data
+        .values()
+        .into_iter()
+        .map(|x| ChildEntry {
+            path: join_path(&current_path, &x.name),
+            name: x.name.clone(),
+            is_directory: x.is_directory,
+            source_path: Some(x.path.clone()),
+            size_bytes: x.size_bytes,
+            modified_unix_seconds: x.modified_unix_seconds,
+        })
+        .collect();
 
     children.sort_unstable_by(|left, right| left.path.cmp(&right.path));
     return Some(DirectoryListing {
@@ -646,6 +757,7 @@ mod tests {
             real_path: None,
             real_path_chance: 0.0,
             allow_symlink: false,
+            fs_cache_ttl: std::time::Duration::from_millis(3000),
             dictionary: default_dictionary(),
             footer_signature: "rfs-webserver/test".to_string(),
             delay: None,
@@ -666,7 +778,8 @@ mod tests {
 
     #[tokio::test]
     async fn directory_listings_are_deterministic_for_same_seed() {
-        let filesystem = VirtualFilesystem::new(config());
+        let config = config();
+        let filesystem = VirtualFilesystem::new(config.clone(), FsCache::new(&config));
         let first = filesystem.directory_listing("/").await.unwrap();
         let second = filesystem.directory_listing("/").await.unwrap();
 
@@ -676,7 +789,8 @@ mod tests {
 
     #[tokio::test]
     async fn directory_depth_is_capped() {
-        let filesystem = VirtualFilesystem::new(config());
+        let config = config();
+        let filesystem = VirtualFilesystem::new(config.clone(), FsCache::new(&config));
         let root = filesystem.root_listing().await;
         let first_directory = root
             .children
@@ -724,7 +838,8 @@ mod tests {
         write_file(&source.join("alpha.txt"), "alpha contents");
         write_file(&source.join("nested").join("child.txt"), "nested contents");
 
-        let filesystem = VirtualFilesystem::new(real_config(source.clone(), 1.0));
+        let config = real_config(source.clone(), 1.0);
+        let filesystem = VirtualFilesystem::new(config.clone(), FsCache::new(&config));
         let root = filesystem.root_listing().await;
 
         let alpha = root
@@ -785,7 +900,7 @@ mod tests {
         config.min_dirs = 2;
         config.max_dirs = 5;
 
-        let filesystem = VirtualFilesystem::new(config);
+        let filesystem = VirtualFilesystem::new(config.clone(), FsCache::new(&config));
         let root = filesystem.root_listing().await;
 
         // Real path contents should appear at root
