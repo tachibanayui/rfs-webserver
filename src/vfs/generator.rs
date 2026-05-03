@@ -1,9 +1,9 @@
-use crate::cli::Config;
+use crate::{cli::Config, vfs::node::FsCache};
 
 use super::node::VirtualFilesystem;
 
 pub fn generate(config: &Config) -> VirtualFilesystem {
-    VirtualFilesystem::new(config.clone())
+    VirtualFilesystem::new(config.clone(), FsCache::new(config))
 }
 
 #[cfg(test)]
@@ -11,8 +11,8 @@ mod tests {
     use super::*;
     use crate::dictionary::default_dictionary;
 
-    #[test]
-    fn generation_keeps_only_configuration_state() {
+    #[tokio::test]
+    async fn generation_keeps_only_configuration_state() {
         let filesystem = generate(&Config {
             host: std::net::Ipv4Addr::LOCALHOST,
             port: 3000,
@@ -25,16 +25,17 @@ mod tests {
             real_path: None,
             real_path_chance: 0.0,
             allow_symlink: false,
+            fs_cache_ttl: std::time::Duration::from_millis(3000),
             dictionary: default_dictionary(),
             footer_signature: "rfs-webserver/test".to_string(),
             delay: None,
         });
 
-        assert!(filesystem.root_listing().children.len() >= 2);
+        assert!(filesystem.root_listing().await.children.len() >= 2);
     }
 
-    #[test]
-    fn generation_is_deterministic_for_same_seed() {
+    #[tokio::test]
+    async fn generation_is_deterministic_for_same_seed() {
         let config = Config {
             host: std::net::Ipv4Addr::LOCALHOST,
             port: 3000,
@@ -47,6 +48,7 @@ mod tests {
             real_path: None,
             real_path_chance: 0.0,
             allow_symlink: false,
+            fs_cache_ttl: std::time::Duration::from_millis(3000),
             dictionary: default_dictionary(),
             footer_signature: "rfs-webserver/test".to_string(),
             delay: None,
@@ -56,8 +58,8 @@ mod tests {
         let second = generate(&config);
 
         assert_eq!(
-            first.root_listing().children,
-            second.root_listing().children
+            first.root_listing().await.children,
+            second.root_listing().await.children
         );
     }
 }
