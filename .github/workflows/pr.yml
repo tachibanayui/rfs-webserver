@@ -24,3 +24,46 @@ jobs:
 
             - name: Test
               run: cargo test --locked
+    bench:
+        runs-on: ubuntu-latest
+        steps:
+            - name: Checkout
+              uses: actions/checkout@v4
+            - name: Install Rust
+              uses: dtolnay/rust-toolchain@stable
+              with:
+                  toolchain: stable
+            - name: Cache Cargo dependencies
+              uses: Swatinem/rust-cache@v2
+            - name: Setup K6
+              uses: grafana/setup-k6-action@v1
+
+            - name: Build and Copy
+              run: |
+                  cargo build --locked --release
+                  cp target/release/rfs-webserver ../bench/bench-pr
+                  cp stress.js ../bench/stress-pr.js
+                  git checkout master
+                  cargo build --locked --release
+                  cp target/release/rfs-webserver ../bench/bench-master
+                  cp stress.js ../bench/stress-master.js
+            - name: Start PR
+              run: |
+                  taskset -c 0,1 ./bench-pr --seed 12345 &
+                  sleep 5
+            - name: Run test on PR
+              uses: grafana/run-k6-action@v1
+              with:
+                  path: ../bench/stress-pr.js
+            - name: Stop PR
+              run: killall bench-pr
+            - name: Start master
+              run: |
+                  taskset -c 0,1 ./bench-master --seed 12345 &
+                  sleep 5
+            - name: Run test on master
+              uses: grafana/run-k6-action@v1
+              with:
+                  path: ../bench/stress-master.js
+            - name: Stop PR
+              run: killall bench-master
