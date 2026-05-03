@@ -1,5 +1,4 @@
 use bytes::Bytes;
-use extension_trait::extension_trait;
 use futures::stream::{self, BoxStream};
 use fxhash::{FxBuildHasher, FxHashMap, FxHashSet};
 use quick_cache::sync::Cache;
@@ -7,14 +6,11 @@ use quick_cache::{OptionsBuilder, UnitWeighter};
 use rand::RngExt;
 use rand_xoshiro::Xoshiro256Plus;
 use rand_xoshiro::rand_core::{Rng, SeedableRng};
-use smallstr::SmallString;
-use std::borrow::Borrow;
+use std::borrow::{Borrow, Cow};
 use std::collections::BTreeMap;
 use std::convert::Infallible;
-use std::fmt::Write as _;
 use std::iter;
 use std::marker::PhantomData;
-use std::ops::Deref;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
@@ -23,7 +19,7 @@ use tokio_util::io::ReaderStream;
 
 use crate::cli::Config;
 use crate::dictionary::SizeRange;
-use crate::vfs::naming::{GenString, NameGenerator};
+use crate::vfs::naming::NameGenerator;
 
 #[derive(Debug, Clone)]
 struct RealPathCache {
@@ -236,61 +232,8 @@ impl<'a> SyntheticChildEntry<'a> {
     }
 }
 
-type NodeStr<'a> = Cow<'a, GenString, str>;
+type NodeStr<'a> = Cow<'a, str>;
 type UniqueNameCache<'a> = FxHashSet<NodeStr<'a>>;
-
-/// Mirror std Cow but allow custom IntoOwned type
-#[derive(PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub enum Cow<'a, Owned, Borrowed: ?Sized = Owned> {
-    Borrowed(&'a Borrowed),
-    Onwed(Owned),
-}
-
-impl<'a, Owned: Clone, Borrowed: ?Sized> Clone for Cow<'a, Owned, Borrowed> {
-    fn clone(&self) -> Self {
-        match self {
-            Self::Borrowed(arg0) => Self::Borrowed(arg0),
-            Self::Onwed(arg0) => Self::Onwed(arg0.clone()),
-        }
-    }
-}
-
-impl<'a, Owned, Borrowed> Deref for Cow<'a, Owned, Borrowed>
-where
-    Owned: Deref<Target = Borrowed>,
-    Borrowed: ?Sized,
-{
-    type Target = Borrowed;
-
-    fn deref(&self) -> &Self::Target {
-        match self {
-            Cow::Borrowed(b) => b,
-            Cow::Onwed(o) => o,
-        }
-    }
-}
-
-#[extension_trait]
-pub impl<T> CowExt for T {
-    fn into_owned_cow<Borrowed: ?Sized>(self) -> Cow<'static, Self, Borrowed>
-    where
-        Self: Sized,
-    {
-        Cow::Onwed(self)
-    }
-}
-
-pub trait CowRefExt<'a, T: ?Sized> {
-    fn into_borrowed_cow<Owned>(self) -> Cow<'a, Owned, T>
-    where
-        Self: Sized;
-}
-
-impl<'a, T: ?Sized> CowRefExt<'a, T> for &'a T {
-    fn into_borrowed_cow<Owned>(self) -> Cow<'a, Owned, T> {
-        Cow::Borrowed(self)
-    }
-}
 
 fn gen_synthetic_dir<'a, R>(
     config: &'a Config,
@@ -316,11 +259,9 @@ where
         .map(move |x| {
             let name = unique_name(&mut rng, used_names, |rng| {
                 if x {
-                    name_gen
-                        .directory_name(rng, depth)
-                        .into_borrowed_cow::<GenString>()
+                    name_gen.directory_name(rng, depth).into()
                 } else {
-                    name_gen.file_name(rng).into_owned_cow()
+                    name_gen.file_name(rng).into()
                 }
             });
             SyntheticChildEntry {
@@ -638,9 +579,7 @@ where
         }
     }
 
-    let mut fallback = SmallString::new();
-    write!(&mut fallback, "{}-{}", &*create(rng), random_suffix(rng)).unwrap();
-    let fallback = fallback.into_owned_cow();
+    let fallback: Cow<'_, _> = format!("{}-{}", &*create(rng), random_suffix(rng)).into();
     used.insert(fallback.clone());
     fallback
 }

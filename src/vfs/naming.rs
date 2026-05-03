@@ -1,12 +1,12 @@
 use rand::RngExt;
 use rand_xoshiro::Xoshiro256Plus;
 use rand_xoshiro::rand_core::Rng;
-use smallstr::SmallString;
 use std::fmt::Write;
 use std::marker::PhantomData;
 
 /// Use for constructing strings in a hot loop. Cold string will still remains as std String.
-pub type GenString = SmallString<[u8; 128]>;
+/// Update: turns out using sso cause 8% perf regression so we revert back to String
+pub type GenString = String;
 
 use crate::dictionary::{Dictionary, IdFormat};
 
