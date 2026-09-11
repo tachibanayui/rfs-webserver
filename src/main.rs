@@ -27,7 +27,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let address: SocketAddr = format!("{}:{}", config.host, config.port).parse()?;
     let listener = tokio::net::TcpListener::bind(address).await?;
 
-    println!("llistening on http://{}", listener.local_addr()?);
+    println!("listening on http://{}", listener.local_addr()?);
     axum::serve(listener, app).await?;
 
     Ok(())

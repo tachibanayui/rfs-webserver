@@ -14,7 +14,7 @@ export const options = {
 export default function () {
     // Paste the left most leaf in the vfs tree here, using seed 12345
     http.get(
-        "http://localhost:3000/billing/2026/04/batch/invoices-a9a084b3/pending/04-11cfce56/billing/orders/archive/",
+        "http://localhost:3000/archive-137accdc/2024-377fd2c5/06-2df993fe/06-5232d311/05-26865c8f/04-5f5652ac/2024/04-baebfbb8/05-2038586b/05-f5acaab5/",
     );
 }
 

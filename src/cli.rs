@@ -68,6 +68,10 @@ pub struct Args {
     /// Artificial delay in milliseconds applied per request
     #[arg(long)]
     pub delay_ms: Option<u64>,
+
+    /// Configure time to live (in ms) for filesystem read cache
+    #[arg(long, default_value_t = 3000)]
+    pub fs_cache_ttl: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -83,6 +87,7 @@ pub struct Config {
     pub real_path: Option<PathBuf>,
     pub real_path_chance: f64,
     pub allow_symlink: bool,
+    pub fs_cache_ttl: Duration,
     pub dictionary: Dictionary,
     pub footer_signature: String,
     pub delay: Option<Duration>,
@@ -127,6 +132,7 @@ impl Args {
             dictionary,
             footer_signature: self.footer_signature,
             delay: self.delay_ms.map(Duration::from_millis),
+            fs_cache_ttl: Duration::from_millis(self.fs_cache_ttl),
         })
     }
 }
@@ -194,6 +200,7 @@ mod tests {
             dictionary: None,
             footer_signature: "rfs-webserver/0.1.0".to_string(),
             delay_ms: None,
+            fs_cache_ttl: 3000,
         };
 
         assert!(args.into_config().is_err());
@@ -217,6 +224,7 @@ mod tests {
             dictionary: None,
             footer_signature: "rfs-webserver/0.1.0".to_string(),
             delay_ms: None,
+            fs_cache_ttl: 3000,
         };
 
         let config = args.into_config().expect("config should validate");
