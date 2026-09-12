@@ -23,4 +23,5 @@ COPY --from=builder /app/target/release/rfs-webserver /app/rfs-webserver
 
 EXPOSE 3000
 
-CMD ["/app/rfs-webserver"]
+ENTRYPOINT ["/app/rfs-webserver"]
+CMD [ "executable" ]
